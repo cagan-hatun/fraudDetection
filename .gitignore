@@ -1,0 +1,40 @@
+# --- Java / Maven (backend) ---
+backend/target/
+backend/HELP.md
+.idea/
+*.iws
+*.iml
+*.ipr
+.classpath
+.project
+.settings/
+
+# --- Python (ml) ---
+ml/.venv/
+ml/venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+mlruns/
+mlartifacts/
+
+# --- Node / React (frontend) ---
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# --- Data (never committed, only synthetic samples if any) ---
+ml/data/*
+!ml/data/.gitkeep
+ml/models/*
+!ml/models/.gitkeep
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Editor / OS ---
+.vscode/
+.DS_Store
+Thumbs.db
