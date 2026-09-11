@@ -1,0 +1,9 @@
+# --- Veri analizi / EDA ---
+pandas
+numpy
+matplotlib
+seaborn
+jupyter
+
+# --- Kaggle veri seti indirme ---
+kaggle
