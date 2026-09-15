@@ -32,11 +32,16 @@ fraudDetection/
 | Altyapı | Docker Compose |
 | Veri seti | IEEE-CIS Fraud Detection (Kaggle) |
 
+## Notlar
+
+- Veri setinde açık bir `user_id` yok; kullanıcı bazlı özellikler için `card1+card2+card3+card5+addr1+D1` kombinasyonundan türetilen bir pseudo-kimlik (`uid`) kullanılır. Bu kesin bir kullanıcı ID'si değil, bir yaklaşıklıktır.
+- `failed_attempts_last_hour` özelliği kapsam dışı bırakıldı — bu veri seti yalnızca tamamlanmış işlemleri içeriyor, başarısız/reddedilen giriş denemesi kaydı barındırmıyor. Gerçek bir üretim sisteminde bu özellik authentication servisinden ayrı bir veri kaynağı olarak gelmesi gerekir.
+
 ## Durum
 
 - [x] Repo/monorepo iskeleti
-- [ ] Veri seti indirme ve EDA (ml/)
-- [ ] Feature engineering
+- [x] Veri seti indirme ve EDA (ml/)
+- [ ] Feature engineering (devam ediyor — uid, avg_transaction_amount, amount_deviation_from_user, transactions_last_10min/24h tamamlandı)
 - [ ] Model pipeline ve threshold optimizasyonu
 - [ ] SHAP / BDDK-uyumlu açıklama raporu
 - [ ] FastAPI ML servisi
