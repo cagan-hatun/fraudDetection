@@ -38,3 +38,6 @@ ml/models/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# --- Kişisel çalışma notları (repoya girmez) ---
+HANDOFF.md
