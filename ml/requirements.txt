@@ -7,3 +7,10 @@ jupyter
 
 # --- Kaggle veri seti indirme ---
 kaggle
+
+# --- Modelleme ---
+scikit-learn
+xgboost
+lightgbm
+mlflow
+shap

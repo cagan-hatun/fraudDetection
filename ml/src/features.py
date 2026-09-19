@@ -241,6 +241,19 @@ def add_merchant_risk(df: pd.DataFrame) -> pd.DataFrame:
     satırında global_expanding_fraud_rate de NaN'dır, bu tek satır için
     merchant_risk de NaN kalır — ihmal edilebilir düzeyde, ayrıca ele
     alınmadı.)
+
+    Not (train/serve tutarlılığı, 2026-09-18): Bu hesap her satır için
+    sadece kronolojik olarak ÖNCEki isFraud etiketlerini kullandığından
+    (shift+expanding, zamana göre sıralı) klasik anlamda leakage'a yol
+    açmaz — walk-forward split ile birlikte kullanıldığında, bir validation
+    fold'undaki satırlar hiçbir zaman kendi fold'undan sonraki bir etiketi
+    "görmez". Ama bu, sürekli/canlı güncellenen bir risk tablosunu simüle
+    eder; production'da ise yukarıda belirtildiği gibi PERİYODİK OLARAK
+    DONMUŞ bir lookup kullanılacak. Yani offline değerlendirme metrikleri,
+    donmuş lookup'lı gerçek production davranışına göre hafifçe iyimser
+    olabilir. Bilinçli bir tasarım tercihi: fold-bazlı fit/transform'a
+    refactor etmek yerine, bu tutarsızlık raporda açıkça belgelenecek
+    (bkz. proje raporu / README, model değerlendirme bölümü).
     """
     df = df.copy()
 

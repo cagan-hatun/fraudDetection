@@ -17,6 +17,8 @@ __pycache__/
 .ipynb_checkpoints/
 mlruns/
 mlartifacts/
+mlflow.db
+.trash/
 
 # --- Node / React (frontend) ---
 frontend/node_modules/
@@ -28,6 +30,7 @@ ml/data/*
 !ml/data/.gitkeep
 ml/models/*
 !ml/models/.gitkeep
+ml/checkpoints/
 
 # --- Env / secrets ---
 .env
@@ -41,3 +44,4 @@ Thumbs.db
 
 # --- Kişisel çalışma notları (repoya girmez) ---
 HANDOFF.md
+ml/notes/
