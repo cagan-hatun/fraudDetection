@@ -9,9 +9,11 @@ backend/HELP.md
 .project
 .settings/
 
-# --- Python (ml) ---
+# --- Python (ml / ml-service) ---
 ml/.venv/
 ml/venv/
+ml-service/.venv/
+ml-service/venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
@@ -31,6 +33,8 @@ ml/data/*
 ml/models/*
 !ml/models/.gitkeep
 ml/checkpoints/
+ml-service/models/*
+!ml-service/models/.gitkeep
 
 # --- Env / secrets ---
 .env

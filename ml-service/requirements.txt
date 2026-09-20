@@ -1,0 +1,14 @@
+# --- FastAPI ---
+fastapi
+uvicorn[standard]
+
+# --- Model serving ---
+joblib
+lightgbm
+scikit-learn
+pandas
+numpy
+
+# --- Test ---
+pytest
+httpx
