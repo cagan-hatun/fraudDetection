@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: fraud-postgres
+    environment:
+      POSTGRES_DB: fraud_db
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_pass
+    ports:
+      # Host tarafında 5433: bu makinede 5432'yi zaten native bir
+      # PostgreSQL servisi (Windows service) kullanıyor.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
