@@ -1,0 +1,20 @@
+# Rule Engine kuralları — SpEL koşulları, `#features` üzerinden ml-service'e
+# gönderilen aynı feature map'ine (feature_snapshot ile birebir) erişir.
+# Koşullar `!= null` ile başlıyor çünkü çoğu feature eksik olabilir (bkz.
+# ml/src/features.py'deki NaN felsefesi) — null > sayı karşılaştırması SpEL'de
+# hata fırlatır.
+rules:
+  - name: large_amount
+    description: "Büyük tutarlı işlem ($5000 üzeri)"
+    condition: "#features['TransactionAmt'] != null and #features['TransactionAmt'] > 5000"
+    action: REVIEW
+
+  - name: new_device_meaningful_amount
+    description: "Yeni cihazdan $1000 üzeri işlem"
+    condition: "#features['new_device'] == true and #features['TransactionAmt'] != null and #features['TransactionAmt'] > 1000"
+    action: REVIEW
+
+  - name: high_merchant_risk
+    description: "Yüksek riskli merchant (merchant_risk > 0.5)"
+    condition: "#features['merchant_risk'] != null and #features['merchant_risk'] > 0.5"
+    action: BLOCK

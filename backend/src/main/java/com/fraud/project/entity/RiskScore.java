@@ -51,6 +51,15 @@ public class RiskScore {
     @Column(name = "model_version", nullable = false, length = 50)
     private String modelVersion;
 
+    /**
+     * ML + Rule Engine'in escalate-only birleştirilmiş nihai kararı — ikisi
+     * de bitene kadar NULL. `action` alanı (yukarıda) SAF ML kararı olarak
+     * hiç değişmeden kalır, denetim/model-izleme için.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "final_action", length = 10)
+    private RiskAction finalAction;
+
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "feature_snapshot", nullable = false, columnDefinition = "jsonb")
     private Map<String, Object> featureSnapshot;

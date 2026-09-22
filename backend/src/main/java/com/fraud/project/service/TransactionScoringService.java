@@ -37,19 +37,22 @@ public class TransactionScoringService {
     private final ExplanationRepository explanationRepository;
     private final AuditLogRepository auditLogRepository;
     private final MlServiceClient mlServiceClient;
+    private final RiskFinalizationService riskFinalizationService;
 
     public TransactionScoringService(
         TransactionRepository transactionRepository,
         RiskScoreRepository riskScoreRepository,
         ExplanationRepository explanationRepository,
         AuditLogRepository auditLogRepository,
-        MlServiceClient mlServiceClient
+        MlServiceClient mlServiceClient,
+        RiskFinalizationService riskFinalizationService
     ) {
         this.transactionRepository = transactionRepository;
         this.riskScoreRepository = riskScoreRepository;
         this.explanationRepository = explanationRepository;
         this.auditLogRepository = auditLogRepository;
         this.mlServiceClient = mlServiceClient;
+        this.riskFinalizationService = riskFinalizationService;
     }
 
     @Transactional
@@ -87,6 +90,11 @@ public class TransactionScoringService {
             .thresholdReview(BigDecimal.valueOf(prediction.reviewThreshold()))
             .thresholdBlock(BigDecimal.valueOf(prediction.blockThreshold()))
             .build());
+
+        // Rule Engine (ayrı, paralel bir consumer) bu transaction'ı ML'den
+        // ÖNCE bitirmiş olabilir — o zaman finalize burada tamamlanır. Aksi
+        // halde no-op olur, Rule Engine bitince finalize edecektir.
+        riskFinalizationService.tryFinalize(transactionId);
     }
 
     @Transactional(readOnly = true)
@@ -96,11 +104,12 @@ public class TransactionScoringService {
         }
 
         return riskScoreRepository.findByTransactionId(transactionId)
+            .filter(riskScore -> riskScore.getFinalAction() != null)
             .map(riskScore -> new TransactionStatusResult(
                 transactionId,
                 TransactionStatus.SCORED,
                 riskScore.getFraudProbability(),
-                riskScore.getAction(),
+                riskScore.getFinalAction(),
                 riskScore.getModelVersion()
             ))
             .orElseGet(() -> new TransactionStatusResult(

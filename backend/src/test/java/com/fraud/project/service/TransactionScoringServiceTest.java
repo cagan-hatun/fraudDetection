@@ -40,6 +40,7 @@ class TransactionScoringServiceTest {
     @Mock private ExplanationRepository explanationRepository;
     @Mock private AuditLogRepository auditLogRepository;
     @Mock private MlServiceClient mlServiceClient;
+    @Mock private RiskFinalizationService riskFinalizationService;
 
     @InjectMocks
     private TransactionScoringService scoringService;
@@ -128,6 +129,23 @@ class TransactionScoringServiceTest {
     }
 
     @Test
+    void score_triggersFinalizationAttemptAfterSavingRiskScore() {
+        when(transactionRepository.findById(1L)).thenReturn(Optional.of(Transaction.builder().id(1L).build()));
+        when(mlServiceClient.predict(any()))
+            .thenReturn(new PredictionResult(0.5, RiskAction.REVIEW, "fraud-detection-lightgbm-v1", 0.23, 0.99));
+        when(mlServiceClient.explain(any())).thenReturn(new ExplanationResult(0.0, List.of()));
+        when(riskScoreRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        scoringService.score(1L, FEATURES);
+
+        // ML tarafı Rule Engine'den ÖNCE ya da SONRA bitebilir — her iki
+        // durumda da kendi bittiğinde finalize denemesi tetiklemeli
+        // (RiskFinalizationService no-op yapar eğer Rule Engine henüz
+        // bitmediyse).
+        verify(riskFinalizationService).tryFinalize(1L);
+    }
+
+    @Test
     void getStatus_unknownTransactionId_throws() {
         when(transactionRepository.existsById(42L)).thenReturn(false);
 
@@ -149,7 +167,10 @@ class TransactionScoringServiceTest {
     }
 
     @Test
-    void getStatus_riskScoreExists_returnsScoredWithDetails() {
+    void getStatus_riskScoreExistsButNotYetFinalized_stillReturnsPending() {
+        // ML bitmiş (risk_score var) ama Rule Engine henüz bitmediği için
+        // finalAction hâlâ null — istemciye göre bu hâlâ PENDING'tir, ara
+        // durumları dışarı sızdırmıyoruz.
         RiskScore riskScore = RiskScore.builder()
             .fraudProbability(new java.math.BigDecimal("0.87"))
             .action(RiskAction.REVIEW)
@@ -160,9 +181,27 @@ class TransactionScoringServiceTest {
 
         TransactionStatusResult result = scoringService.getStatus(6L);
 
+        assertThat(result.status()).isEqualTo(TransactionStatus.PENDING);
+    }
+
+    @Test
+    void getStatus_finalized_returnsScoredWithFinalAction() {
+        RiskScore riskScore = RiskScore.builder()
+            .fraudProbability(new java.math.BigDecimal("0.87"))
+            .action(RiskAction.REVIEW)
+            .finalAction(RiskAction.BLOCK)
+            .modelVersion("fraud-detection-lightgbm-v1")
+            .build();
+        when(transactionRepository.existsById(6L)).thenReturn(true);
+        when(riskScoreRepository.findByTransactionId(6L)).thenReturn(Optional.of(riskScore));
+
+        TransactionStatusResult result = scoringService.getStatus(6L);
+
         assertThat(result.status()).isEqualTo(TransactionStatus.SCORED);
         assertThat(result.fraudProbability()).isEqualByComparingTo("0.87");
-        assertThat(result.action()).isEqualTo(RiskAction.REVIEW);
+        // finalAction (Rule Engine ile escalate olmuş) dönüyor, ML'in HAM
+        // action'ı (REVIEW) değil.
+        assertThat(result.action()).isEqualTo(RiskAction.BLOCK);
         assertThat(result.modelVersion()).isEqualTo("fraud-detection-lightgbm-v1");
     }
 }

@@ -1,6 +1,6 @@
 # Fraud Detection — Spring Boot Backend
 
-Bankacılık senaryosunu simüle eden REST API: işlemleri (demo fixture'lar üzerinden) "replay" eder, Kafka üzerinden asenkron olarak `ml-service`'i (FastAPI/LightGBM) çağırır, sonucu ve SHAP açıklamalarını PostgreSQL'e yazar, JWT ile korunur. Mimarideki rolü: `Transaction → PostgreSQL → Kafka → ML Service (+ ileride Rule Engine)` akışının Spring tarafı — Rule Engine parçası henüz eklenmedi (bkz. Sıradaki Adımlar).
+Bankacılık senaryosunu simüle eden REST API: işlemleri (demo fixture'lar üzerinden) "replay" eder, Kafka üzerinden asenkron olarak hem `ml-service`'i (FastAPI/LightGBM) hem de kendi Rule Engine'ini PARALEL çalıştırır, ikisinin kararını birleştirip sonucu (SHAP açıklamalarıyla birlikte) PostgreSQL'e yazar, JWT ile korunur. Mimarideki rolü: `Transaction → PostgreSQL → Kafka → (ML Service + Rule Engine) → Risk Engine → APPROVE/REVIEW/BLOCK` akışının TAMAMI artık burada.
 
 > Bu servis `ml-service`'e REST, Kafka'ya ise (dev broker) bağımlı. Çalıştırmadan önce `ml-service/README.md`'deki adımlarla onu ayağa kaldır ve `infra/docker-compose.yml`'ı başlat.
 
@@ -14,16 +14,20 @@ backend/src/main/java/com/fraud/project/
 ├── fixture/         # Demo "replay" fixture'ları (DemoTransactionFixture, DemoFixtureLoader)
 ├── mlservice/       # ml-service REST istemcisi (MlServiceClient, PredictionResult,
 │                    #   ExplanationResult, FeatureContribution)
-├── kafka/           # TransactionScoringEvent, TransactionEventProducer, TransactionScoringConsumer
-├── service/         # İş mantığı — TransactionReplayService (üretici: transaction kaydet +
-│                    #   event bas), TransactionScoringService (tüketici: ml-service çağır + yaz)
+├── kafka/           # TransactionScoringEvent, TransactionEventProducer,
+│                    #   TransactionScoringConsumer (ML tarafı), RuleEngineConsumer (Rule Engine tarafı)
+├── rules/           # RuleDefinition(Loader), RuleEvaluator (SpEL tabanlı kural motoru)
+├── service/         # İş mantığı — TransactionReplayService (üretici), TransactionScoringService
+│                    #   (ML tüketicisi), RuleEngineService (Rule Engine tüketicisi),
+│                    #   RiskFinalizationService (ikisini escalate-only birleştirir)
 ├── security/        # JWT (JwtService, JwtAuthenticationFilter, AppUserDetailsService)
 ├── controller/      # REST endpoint'leri (DemoController, AuthController + DTO'lar)
 └── config/          # SecurityConfig, MlServiceConfig
 
 backend/src/main/resources/
-├── db/migration/    # Flyway migration'ları (V1: domain şeması, V2: app_users)
-└── fixtures/        # demo_transactions.json — IEEE-CIS holdout'tan gerçek satırlar
+├── db/migration/    # Flyway migration'ları (V1: domain şeması, V2: app_users, V3: rule_evaluations)
+├── fixtures/        # demo_transactions.json — IEEE-CIS holdout'tan gerçek satırlar
+└── rules/           # rules.yaml — Rule Engine'in SpEL koşulları
 ```
 
 ## Mimari Kararlar ve Kavramlar
@@ -36,15 +40,19 @@ ML modeli IEEE-CIS'in 120 ham/anonim sütunuyla (`V1-339`, `C1-14`, `D1-15`... �
 
 `fixtures/demo_transactions.json`, IEEE-CIS holdout setinden (modele hiç karışmamış, gerçek etiketli) seçilmiş 6 gerçek satır içeriyor: `caught_fraud` (doğru yakalanan), `missed_fraud` (kaçırılan — modelin kör noktası), `false_positive` (yanlış alarm), `ordinary_small/medium/large`. Bilinçli bir tasarım kararı: veritabanı pipeline'ın ÇIKTISI olmalı, GİRDİSİ değil — fixture'lar DB'ye önceden yazılsaydı `replay` endpoint'inin "sıfırdan gerçekten çalıştığını" göstermenin bir anlamı kalmazdı. Anonim sütunlar (V/C/D...) sentetik ÜRETİLMEDİ — istatistiksel örnekleme modelin asıl sinyalini gürültüye çevirirdi, bu yüzden gerçek holdout satırları kullanıldı.
 
-### 3. Asenkron akış: `TransactionReplayService` (üretici) → Kafka → `TransactionScoringService` (tüketici)
+### 3. Asenkron akış: iki BAĞIMSIZ paralel Kafka consumer'ı + escalate-only birleştirme
 
-`POST /replay` senkron değil — hemen `202 Accepted` + `{transactionId, status: PENDING}` döner, gerçek skorlama arka planda olur:
+`POST /replay` senkron değil — hemen `202 Accepted` + `{transactionId, status: PENDING}` döner, gerçek skorlama arka planda, İKİ AYRI consumer group'ta PARALEL olarak olur:
 
 1. **`TransactionReplayService.replay()`** (`@Transactional`): User/Device/Merchant find-or-create → Transaction kaydet → `transactions` topic'ine `{transactionId, features}` event'i bas.
-2. **`TransactionScoringConsumer`** (`@KafkaListener`) event'i alır, **`TransactionScoringService.score()`**'a devreder: `ml-service /predict` çağır → RiskScore kaydet → `/explain` çağır → her feature katkısı için bir Explanation satırı → bir AuditLog satırı (`actor=SYSTEM`, çünkü şu an bu akışı tetikleyen bir insan analist yok).
-3. **`GET /transactions/{id}`** sonucu sorgular — `risk_scores`'ta o transaction'a ait bir satır var mı yok mu, buna göre `PENDING`/`SCORED` döner.
+2. **ML tarafı** — `TransactionScoringConsumer` (consumer group `fraud-backend`) event'i alır, `TransactionScoringService.score()`'a devreder: `ml-service /predict` çağır → RiskScore kaydet (`action` = SAF ML kararı) → `/explain` çağır → Explanation satırları → bir AuditLog satırı (`actor=SYSTEM`).
+3. **Rule Engine tarafı** — `RuleEngineConsumer` (AYRI consumer group `fraud-rule-engine`, aynı topic'in kendi kopyasını alır) event'i alır, `RuleEngineService.evaluate()`'e devreder: `rules.yaml`'daki SpEL koşullarını feature map'e karşı çalıştırır, eşleşen kuralların en ağırını `rule_evaluations`'a yazar.
+4. **`RiskFinalizationService.tryFinalize()`** — HER İKİ taraf da kendi işi bitince bunu çağırır (idempotent: ikisi de yazmadıysa no-op, zaten finalize edilmişse no-op). İkisi de yazmışsa escalate-only (`RiskActionSeverity`: BLOCK > REVIEW > APPROVE) ile `risk_scores.final_action`'ı hesaplar. Rule Engine gerçekten bir şeyi değiştirdiyse (`final_action != action`) ikinci bir AuditLog satırı (`actor=RULE_ENGINE`) düşer — değiştirmediyse gürültü eklenmez.
+5. **`GET /transactions/{id}`** — `final_action` set edilene kadar `PENDING`, sonra `SCORED` + nihai (escalate edilmiş) `action` döner. Ara durumlar (sadece biri bitmiş) dışarı sızdırılmıyor.
 
-**Kritik detay — "dual write" tuzağı:** `transaction.getId()`'yi aldıktan hemen sonra Kafka'ya basmak YANLIŞ olurdu — DB transaction'ı henüz commit olmadan consumer (aynı JVM'de, çok hızlı) event'i işleyip `transactionRepository.findById()` çağırırsa transaction'ı bulamaz. Çözüm: `TransactionSynchronizationManager.registerSynchronization(...)` ile publish'i `afterCommit()` callback'ine erteliyoruz — Kafka'ya basmak, ancak DB transaction'ı gerçekten commit olduktan SONRA gerçekleşiyor. `TransactionReplayServiceTest.replay_doesNotPublishUntilTransactionCommits` bunu doğrudan test ediyor.
+**Kritik detay — "dual write" tuzağı:** `transaction.getId()`'yi aldıktan hemen sonra Kafka'ya basmak YANLIŞ olurdu — DB transaction'ı henüz commit olmadan consumer'lar (aynı JVM'de, çok hızlı) event'i işleyip `transactionRepository.findById()` çağırırsa transaction'ı bulamaz. Çözüm: `TransactionSynchronizationManager.registerSynchronization(...)` ile publish'i `afterCommit()` callback'ine erteliyoruz. `TransactionReplayServiceTest.replay_doesNotPublishUntilTransactionCommits` bunu doğrudan test ediyor.
+
+**Rule Engine — Drools değil, Spring'in kendi SpEL'i:** `rules.yaml`'daki koşullar (`#features['TransactionAmt'] > 5000` gibi) Spring Expression Language ile değerlendiriliyor — zaten classpath'te, yeni bağımlılık yok, ve "configurable YAML/JSON kurallar, Drools gibi ağır bir framework değil" kararıyla tutarlı. Örnek kurallar: büyük tutar (>$5000), yeni cihazdan $1000 üzeri işlem, yüksek riskli merchant (`merchant_risk > 0.5`).
 
 ### 4. ml-service entegrasyonu — Spring Boot 4.1.1'in yeni/parçalanmış yapısıyla boğuşma
 
@@ -69,9 +77,10 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 | Tablo | Amaç |
 |---|---|
 | `users`, `devices`, `merchants`, `transactions` | Gerçekçi bankacılık domain'i |
-| `risk_scores` | ML kararı: `fraud_probability`, `action`, `model_version`, `feature_snapshot` (JSONB) |
+| `risk_scores` | `action` = SAF ML kararı, `final_action` = ML+Rule Engine escalate-only birleşimi (ikisi bitene kadar NULL), `feature_snapshot` (JSONB) |
+| `rule_evaluations` | Rule Engine'in ML'den bağımsız kendi kararı + eşleşen kural adları (`transaction_id` UNIQUE) |
 | `explanations` | Bir risk_score'a bağlı SHAP katkıları (uzun/long format — feature sayısı şemayı etkilemez) |
-| `audit_log` | Denetim izi: kim/ne zaman/hangi model/hangi eşikle karar verildi (BDDK gereksinimi) |
+| `audit_log` | Denetim izi — ML kararı için bir satır (`actor=SYSTEM`), Rule Engine gerçekten escalate ettiyse ikinci bir satır (`actor=RULE_ENGINE`) |
 | `app_users` | JWT ile giriş yapan analist/admin hesapları (banking müşterisiyle KARIŞTIRILMAMALI) |
 
 ## API Uç Noktaları
@@ -81,7 +90,7 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 | `POST /api/auth/login` | Açık | `{username, password}` → `{token}` |
 | `GET /api/demo/scenarios` | Bearer JWT | Fixture senaryolarının listesi |
 | `POST /api/demo/replay/{scenarioId}` | Bearer JWT | Bir senaryoyu tetikler — `202` + `{transactionId, status: PENDING}` döner |
-| `GET /api/demo/transactions/{id}` | Bearer JWT | Skorlama sonucu — `PENDING` ya da `SCORED` + `fraudProbability/action/modelVersion` |
+| `GET /api/demo/transactions/{id}` | Bearer JWT | Skorlama sonucu — `PENDING` ya da `SCORED` + `fraudProbability/action/modelVersion` (`action` = ML+Rule Engine'in nihai/escalate edilmiş kararı) |
 
 ## Çalıştırma
 
@@ -120,12 +129,13 @@ curl -H "Authorization: Bearer $TOKEN" \
 ./mvnw test
 ```
 
-22 test (Docker/DB gerektirmez): `DemoFixtureLoaderTest` (fixture JSON parse + gerçek dosya doğrulaması), `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, durum sorgusu), `TransactionEventProducerTest`/`TransactionScoringConsumerTest`, `JwtServiceTest`, `AppUserDetailsServiceTest`.
+41 test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`.
+
+**Uçtan uca doğrulama notu:** Escalation'ı gerçek Kafka/consumer altyapısıyla canlı doğrulamak için `rules.yaml`'daki bir eşik geçici olarak düşürülüp gerçek bir fixture ile tetiklendi (ML=APPROVE, Rule Engine=REVIEW, final_action=REVIEW, iki ayrı audit_log satırı) — sonra eşik gerçek değerine geri alındı. Mevcut 6 demo fixture'ının hiçbiri gerçek eşiklerle (>$5000, merchant_risk>0.5) bir kuralı tetiklemiyor; bu bilinçli, fixture'lar sentetik değil gerçek holdout satırları olduğu için.
 
 ## Bilinen Sınırlılıklar / Sıradaki Adımlar
 
-- **Rule Engine yok** — Kafka'yı asıl mimarideki gibi paralel tüketmesi planlanan configurable YAML/JSON kural motoru henüz eklenmedi (şu an `transactions` topic'ini sadece `TransactionScoringService` tüketiyor).
-- **Kafka hata yönetimi minimal** — consumer'da özel bir retry/DLQ (dead-letter queue) politikası yok, Spring Kafka'nın varsayılan davranışına güveniliyor.
+- **Kafka hata yönetimi minimal** — consumer'larda özel bir retry/DLQ (dead-letter queue) politikası yok, Spring Kafka'nın varsayılan davranışına güveniliyor.
 - **Gerçek transaction ingestion API'si yok** — şu an sadece önceden tanımlı 6 demo senaryosu "replay" edilebiliyor, keyfi bir işlem submit edilemiyor (bilinçli — bkz. yukarıdaki fixture kararı, IEEE-CIS'in anonim sütunları serbest girişle doldurulamaz).
 - **Testcontainers henüz yok** — testler Mockito ile izole; gerçek DB'ye karşı entegrasyon testleri ayrı bir iş kalemi.
 - **Resilience4j (circuit breaker/retry) yok** — ml-service kesintisi senaryosu henüz ele alınmadı.
