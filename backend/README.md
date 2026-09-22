@@ -1,8 +1,8 @@
 # Fraud Detection — Spring Boot Backend
 
-Bankacılık senaryosunu simüle eden REST API: işlemleri (demo fixture'lar üzerinden) "replay" eder, `ml-service`'i (FastAPI/LightGBM) senkron çağırır, sonucu ve SHAP açıklamalarını PostgreSQL'e yazar, JWT ile korunur. Mimarideki rolü: `Transaction → PostgreSQL → (ml-service + Rule Engine) → Risk Kararı` akışının Spring tarafı — Kafka/Rule Engine parçaları henüz eklenmedi (bkz. Sıradaki Adımlar).
+Bankacılık senaryosunu simüle eden REST API: işlemleri (demo fixture'lar üzerinden) "replay" eder, Kafka üzerinden asenkron olarak `ml-service`'i (FastAPI/LightGBM) çağırır, sonucu ve SHAP açıklamalarını PostgreSQL'e yazar, JWT ile korunur. Mimarideki rolü: `Transaction → PostgreSQL → Kafka → ML Service (+ ileride Rule Engine)` akışının Spring tarafı — Rule Engine parçası henüz eklenmedi (bkz. Sıradaki Adımlar).
 
-> Bu servis `ml-service`'e REST üzerinden bağımlı. Çalıştırmadan önce `ml-service/README.md`'deki adımlarla onu ayağa kaldır.
+> Bu servis `ml-service`'e REST, Kafka'ya ise (dev broker) bağımlı. Çalıştırmadan önce `ml-service/README.md`'deki adımlarla onu ayağa kaldır ve `infra/docker-compose.yml`'ı başlat.
 
 ## Proje Yapısı
 
@@ -14,7 +14,9 @@ backend/src/main/java/com/fraud/project/
 ├── fixture/         # Demo "replay" fixture'ları (DemoTransactionFixture, DemoFixtureLoader)
 ├── mlservice/       # ml-service REST istemcisi (MlServiceClient, PredictionResult,
 │                    #   ExplanationResult, FeatureContribution)
-├── service/         # İş mantığı (TransactionReplayService, ReplayResult)
+├── kafka/           # TransactionScoringEvent, TransactionEventProducer, TransactionScoringConsumer
+├── service/         # İş mantığı — TransactionReplayService (üretici: transaction kaydet +
+│                    #   event bas), TransactionScoringService (tüketici: ml-service çağır + yaz)
 ├── security/        # JWT (JwtService, JwtAuthenticationFilter, AppUserDetailsService)
 ├── controller/      # REST endpoint'leri (DemoController, AuthController + DTO'lar)
 └── config/          # SecurityConfig, MlServiceConfig
@@ -34,9 +36,15 @@ ML modeli IEEE-CIS'in 120 ham/anonim sütunuyla (`V1-339`, `C1-14`, `D1-15`... �
 
 `fixtures/demo_transactions.json`, IEEE-CIS holdout setinden (modele hiç karışmamış, gerçek etiketli) seçilmiş 6 gerçek satır içeriyor: `caught_fraud` (doğru yakalanan), `missed_fraud` (kaçırılan — modelin kör noktası), `false_positive` (yanlış alarm), `ordinary_small/medium/large`. Bilinçli bir tasarım kararı: veritabanı pipeline'ın ÇIKTISI olmalı, GİRDİSİ değil — fixture'lar DB'ye önceden yazılsaydı `replay` endpoint'inin "sıfırdan gerçekten çalıştığını" göstermenin bir anlamı kalmazdı. Anonim sütunlar (V/C/D...) sentetik ÜRETİLMEDİ — istatistiksel örnekleme modelin asıl sinyalini gürültüye çevirirdi, bu yüzden gerçek holdout satırları kullanıldı.
 
-### 3. `TransactionReplayService` — tek bir `@Transactional` akış
+### 3. Asenkron akış: `TransactionReplayService` (üretici) → Kafka → `TransactionScoringService` (tüketici)
 
-Bir fixture seçildiğinde: User/Device/Merchant find-or-create → Transaction kaydet → `ml-service /predict` çağır → RiskScore kaydet → `ml-service /explain` çağır → her feature katkısı için bir Explanation satırı → bir AuditLog satırı (`actor=SYSTEM`, çünkü şu an bu akışı tetikleyen bir insan analist yok). Hepsi tek transaction sınırında — `/predict` ya da `/explain` başarısız olursa tüm yazımlar geri alınır.
+`POST /replay` senkron değil — hemen `202 Accepted` + `{transactionId, status: PENDING}` döner, gerçek skorlama arka planda olur:
+
+1. **`TransactionReplayService.replay()`** (`@Transactional`): User/Device/Merchant find-or-create → Transaction kaydet → `transactions` topic'ine `{transactionId, features}` event'i bas.
+2. **`TransactionScoringConsumer`** (`@KafkaListener`) event'i alır, **`TransactionScoringService.score()`**'a devreder: `ml-service /predict` çağır → RiskScore kaydet → `/explain` çağır → her feature katkısı için bir Explanation satırı → bir AuditLog satırı (`actor=SYSTEM`, çünkü şu an bu akışı tetikleyen bir insan analist yok).
+3. **`GET /transactions/{id}`** sonucu sorgular — `risk_scores`'ta o transaction'a ait bir satır var mı yok mu, buna göre `PENDING`/`SCORED` döner.
+
+**Kritik detay — "dual write" tuzağı:** `transaction.getId()`'yi aldıktan hemen sonra Kafka'ya basmak YANLIŞ olurdu — DB transaction'ı henüz commit olmadan consumer (aynı JVM'de, çok hızlı) event'i işleyip `transactionRepository.findById()` çağırırsa transaction'ı bulamaz. Çözüm: `TransactionSynchronizationManager.registerSynchronization(...)` ile publish'i `afterCommit()` callback'ine erteliyoruz — Kafka'ya basmak, ancak DB transaction'ı gerçekten commit olduktan SONRA gerçekleşiyor. `TransactionReplayServiceTest.replay_doesNotPublishUntilTransactionCommits` bunu doğrudan test ediyor.
 
 ### 4. ml-service entegrasyonu — Spring Boot 4.1.1'in yeni/parçalanmış yapısıyla boğuşma
 
@@ -72,12 +80,13 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 |---|---|---|
 | `POST /api/auth/login` | Açık | `{username, password}` → `{token}` |
 | `GET /api/demo/scenarios` | Bearer JWT | Fixture senaryolarının listesi |
-| `POST /api/demo/replay/{scenarioId}` | Bearer JWT | Bir senaryoyu uçtan uca çalıştırır |
+| `POST /api/demo/replay/{scenarioId}` | Bearer JWT | Bir senaryoyu tetikler — `202` + `{transactionId, status: PENDING}` döner |
+| `GET /api/demo/transactions/{id}` | Bearer JWT | Skorlama sonucu — `PENDING` ya da `SCORED` + `fraudProbability/action/modelVersion` |
 
 ## Çalıştırma
 
 ```bash
-# 1. Postgres (dev)
+# 1. Postgres + Kafka (dev)
 docker compose -f ../infra/docker-compose.yml up -d
 
 # 2. ml-service (ayrı terminalde, bkz. ml-service/README.md)
@@ -94,9 +103,15 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"analyst","password":"ChangeMe123!"}' | jq -r .token)
 
-# Bir senaryoyu çalıştır
+# Bir senaryoyu tetikle (hemen PENDING döner)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:8080/api/demo/replay/caught_fraud
+# {"transactionId":23,"status":"PENDING"}
+
+# Birkaç saniye sonra sonucu sorgula (Kafka consumer arka planda işledi)
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/api/demo/transactions/23
+# {"transactionId":23,"status":"SCORED","fraudProbability":0.99995,"action":"BLOCK",...}
 ```
 
 ## Test
@@ -105,12 +120,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ./mvnw test
 ```
 
-16 test (Docker/DB gerektirmez): `DemoFixtureLoaderTest` (fixture JSON parse + gerçek dosya doğrulaması), `TransactionReplayServiceTest` (find-or-create mantığı, ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı), `JwtServiceTest` (token üretme/doğrulama, süre dolması, imza bozulması), `AppUserDetailsServiceTest`.
+22 test (Docker/DB gerektirmez): `DemoFixtureLoaderTest` (fixture JSON parse + gerçek dosya doğrulaması), `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, durum sorgusu), `TransactionEventProducerTest`/`TransactionScoringConsumerTest`, `JwtServiceTest`, `AppUserDetailsServiceTest`.
 
 ## Bilinen Sınırlılıklar / Sıradaki Adımlar
 
-- **Kafka asenkron akışı henüz yok** — şu an her şey senkron (`DemoController` → `TransactionReplayService` → `ml-service`). Planlanan akış: `Transaction API → PostgreSQL → Kafka → ML Service + Rule Engine` paralel tüketir.
-- **Rule Engine yok** — configurable YAML/JSON kural motoru henüz eklenmedi.
+- **Rule Engine yok** — Kafka'yı asıl mimarideki gibi paralel tüketmesi planlanan configurable YAML/JSON kural motoru henüz eklenmedi (şu an `transactions` topic'ini sadece `TransactionScoringService` tüketiyor).
+- **Kafka hata yönetimi minimal** — consumer'da özel bir retry/DLQ (dead-letter queue) politikası yok, Spring Kafka'nın varsayılan davranışına güveniliyor.
 - **Gerçek transaction ingestion API'si yok** — şu an sadece önceden tanımlı 6 demo senaryosu "replay" edilebiliyor, keyfi bir işlem submit edilemiyor (bilinçli — bkz. yukarıdaki fixture kararı, IEEE-CIS'in anonim sütunları serbest girişle doldurulamaz).
 - **Testcontainers henüz yok** — testler Mockito ile izole; gerçek DB'ye karşı entegrasyon testleri ayrı bir iş kalemi.
 - **Resilience4j (circuit breaker/retry) yok** — ml-service kesintisi senaryosu henüz ele alınmadı.

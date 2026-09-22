@@ -4,8 +4,9 @@ import java.math.BigDecimal;
 
 import com.fraud.project.entity.RiskAction;
 
-public record ReplayResult(
+public record TransactionStatusResult(
     Long transactionId,
+    TransactionStatus status,
     BigDecimal fraudProbability,
     RiskAction action,
     String modelVersion
