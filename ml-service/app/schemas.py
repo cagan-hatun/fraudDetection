@@ -5,7 +5,7 @@ DİNAMİK olarak üretiyoruz (`pydantic.create_model`) — `final_features`
 listesi değişirse şema otomatik güncellenir, elle senkronize etmeye
 gerek kalmaz.
 """
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, create_model
 
@@ -31,3 +31,17 @@ def build_transaction_request_model(bundle: ModelBundle) -> type[BaseModel]:
 class PredictionResponse(BaseModel):
     fraud_probability: float
     action: Literal["APPROVE", "REVIEW", "BLOCK"]
+    model_version: str
+    review_threshold: float
+    block_threshold: float
+
+
+class FeatureContribution(BaseModel):
+    feature_name: str
+    feature_value: Optional[Union[float, str]]
+    shap_value: float
+
+
+class ExplanationResponse(BaseModel):
+    base_value: float
+    contributions: list[FeatureContribution]

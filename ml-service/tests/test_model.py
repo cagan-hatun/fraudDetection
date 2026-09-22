@@ -4,7 +4,7 @@ izole şekilde test eder (hızlı, dış bağımlılık yok).
 import numpy as np
 import pandas as pd
 
-from app.model import ModelBundle, _build_feature_dataframe, predict
+from app.model import ModelBundle, _build_feature_dataframe, explain, predict
 
 
 class StubModel:
@@ -24,9 +24,25 @@ class StubModel:
         return np.array([[1 - self.fixed_proba, self.fixed_proba]] * n)
 
 
-def make_bundle(fixed_proba: float = 0.0) -> ModelBundle:
+class StubExplainer:
+    """shap.TreeExplainer'ın gerçek ağaç yapısına ihtiyaç duyan iç işleyişini
+    atlayıp, `explain()`'in SADECE veri dönüştürme mantığını (contributions
+    listesi kurma, base_value ekleme) izole test etmemizi sağlar.
+    """
+
+    def __init__(self, shap_row: list[float], expected_value: float):
+        self.shap_row = shap_row
+        self.expected_value = expected_value
+
+    def shap_values(self, X):
+        return np.array([self.shap_row])
+
+
+def make_bundle(fixed_proba: float = 0.0, explainer: object = None) -> ModelBundle:
     return ModelBundle(
         model=StubModel(fixed_proba),
+        explainer=explainer,
+        model_version="fraud-detection-lightgbm-v1",
         final_features=["TransactionAmt", "ProductCD"],
         numeric_columns=["TransactionAmt"],
         categorical_columns=["ProductCD"],
@@ -40,6 +56,9 @@ def test_predict_approve_below_review_threshold():
     result = predict(bundle, {"TransactionAmt": 100.0, "ProductCD": "W"})
     assert result["action"] == "APPROVE"
     assert result["fraud_probability"] == 0.10
+    assert result["model_version"] == "fraud-detection-lightgbm-v1"
+    assert result["review_threshold"] == 0.23
+    assert result["block_threshold"] == 0.99
 
 
 def test_predict_review_between_thresholds():
@@ -76,3 +95,22 @@ def test_build_feature_dataframe_missing_numeric_becomes_nan():
     bundle = make_bundle()
     df = _build_feature_dataframe(bundle, {"ProductCD": "W"})  # TransactionAmt verilmedi
     assert pd.isna(df["TransactionAmt"].iloc[0])
+
+
+def test_explain_returns_one_contribution_per_feature():
+    bundle = make_bundle(explainer=StubExplainer(shap_row=[0.8, -0.3], expected_value=-1.2))
+    result = explain(bundle, {"TransactionAmt": 250.0, "ProductCD": "W"})
+    assert result["base_value"] == -1.2
+    assert len(result["contributions"]) == 2
+
+
+def test_explain_uses_raw_request_value_not_category_code():
+    # feature_value, model'in içeride kullandığı kategori KODU (örn. 4)
+    # değil, isteğin geldiği HAM string olmalı — açıklama okunur kalsın diye.
+    bundle = make_bundle(explainer=StubExplainer(shap_row=[0.0, 0.5], expected_value=0.0))
+    result = explain(bundle, {"TransactionAmt": 100.0, "ProductCD": "W"})
+    product_cd_contribution = next(
+        c for c in result["contributions"] if c["feature_name"] == "ProductCD"
+    )
+    assert product_cd_contribution["feature_value"] == "W"
+    assert product_cd_contribution["shap_value"] == 0.5

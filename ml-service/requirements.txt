@@ -8,6 +8,7 @@ lightgbm
 scikit-learn
 pandas
 numpy
+shap==0.52.0
 
 # --- Test ---
 pytest
