@@ -70,7 +70,7 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 
 ### 6. Test stratejisi
 
-Şu an tamamı **unit test** (Mockito ile DB/ml-service mock'lanıyor) — gerçek veritabanı gerektiren entegrasyon testleri bilinçli olarak ertelendi, Testcontainers eklenene kadar (bkz. Sıradaki Adımlar). Bunun yerine her önemli akış, gerçek Postgres + gerçek ml-service'e karşı elle (curl ile) uçtan uca doğrulandı.
+45 test **unit test** (Mockito ile DB/ml-service mock'lanıyor) + 2 **entegrasyon testi** (Testcontainers ile gerçek Postgres + gerçek Kafka'ya karşı): `PostgresPersistenceIntegrationTest` (Flyway migration'larının V1-V3 temiz bir DB'de gerçekten çalıştığını ve `RiskScore.featureSnapshot` gibi jsonb alanların Hibernate ile doğru round-trip ettiğini kanıtlar) ve `KafkaRetryAndDeadLetterIntegrationTest` (`KafkaErrorHandlingConfig`'teki retry+DLQ mekanizmasının gerçek bir broker'a karşı çalıştığını otomatik olarak doğrular — `MlServiceClient` bu testte `@MockitoBean` ile deterministik hata üretecek şekilde değiştiriliyor, ml-service'in kendisine bağımlı olmadan). İkisi de aynı static container çiftini paylaşıyor (bkz. `AbstractIntegrationTest`).
 
 ## Veritabanı Şeması
 
@@ -129,14 +129,20 @@ curl -H "Authorization: Bearer $TOKEN" \
 ./mvnw test
 ```
 
-41 test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`.
+47 test. 45'i unit test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`, `GlobalExceptionHandlerTest`, `ResilienceConfigTest` (circuit breaker'ın gerçekten CLOSED→OPEN geçtiğini ve OPEN'ken çağrıyı anında reddettiğini doğrular). 2'si Testcontainers ile gerçek Postgres+Kafka'ya karşı çalışan entegrasyon testi (Docker gerektirir, ~30sn) — bkz. yukarıdaki Test Stratejisi.
 
 **Uçtan uca doğrulama notu:** Escalation'ı gerçek Kafka/consumer altyapısıyla canlı doğrulamak için `rules.yaml`'daki bir eşik geçici olarak düşürülüp gerçek bir fixture ile tetiklendi (ML=APPROVE, Rule Engine=REVIEW, final_action=REVIEW, iki ayrı audit_log satırı) — sonra eşik gerçek değerine geri alındı. Mevcut 6 demo fixture'ının hiçbiri gerçek eşiklerle (>$5000, merchant_risk>0.5) bir kuralı tetiklemiyor; bu bilinçli, fixture'lar sentetik değil gerçek holdout satırları olduğu için.
 
 ## Bilinen Sınırlılıklar / Sıradaki Adımlar
 
-- **Kafka hata yönetimi minimal** — consumer'larda özel bir retry/DLQ (dead-letter queue) politikası yok, Spring Kafka'nın varsayılan davranışına güveniliyor.
+Aşağıdaki dört madde kapatıldı:
+
+- ✅ **Global exception handler** — `exception/GlobalExceptionHandler.java`, tüm hatalar (bizimkiler + Spring'in framework hataları) RFC 7807 `ProblemDetail` formatında dönüyor, stack trace client'a sızmıyor.
+- ✅ **Kafka retry/DLQ** — `config/KafkaErrorHandlingConfig.java`, her consumer group için ayrı hata yönetimi (3 deneme + 1sn backoff, sonra group'a özel bir Dead Letter Topic: `transactions.fraud-backend.DLT` / `transactions.fraud-rule-engine.DLT`).
+- ✅ **Resilience4j** — `config/ResilienceConfig.java`, ml-service çağrıları etrafında circuit breaker (kasıtlı olarak retry yok, Kafka'nın kendi retry'ıyla çakışmasın diye; fallback yok, DLQ zaten güvenlik ağı).
+- ✅ **Testcontainers** — `PostgresPersistenceIntegrationTest` ve `KafkaRetryAndDeadLetterIntegrationTest`, gerçek Postgres+Kafka container'larına karşı çalışıyor.
+
+Kalan bilinçli sınırlılık:
+
 - **Gerçek transaction ingestion API'si yok** — şu an sadece önceden tanımlı 6 demo senaryosu "replay" edilebiliyor, keyfi bir işlem submit edilemiyor (bilinçli — bkz. yukarıdaki fixture kararı, IEEE-CIS'in anonim sütunları serbest girişle doldurulamaz).
-- **Testcontainers henüz yok** — testler Mockito ile izole; gerçek DB'ye karşı entegrasyon testleri ayrı bir iş kalemi.
-- **Resilience4j (circuit breaker/retry) yok** — ml-service kesintisi senaryosu henüz ele alınmadı.
-- **Global exception handler yok** — hata cevapları şu an Spring'in varsayılan formatında (stack trace dahil), production'a uygun değil.
+- **DLQ'ya düşen mesajlar için bir redrive/yeniden işleme aracı yok** — bilinçli olarak kapsam dışı bırakıldı (portfolyo projesi ölçeğinde gereksiz); DLQ'ya düşen bir transaction kalıcı olarak `PENDING` kalır.
