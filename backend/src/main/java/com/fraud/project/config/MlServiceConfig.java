@@ -1,6 +1,7 @@
 package com.fraud.project.config;
 
 import java.net.http.HttpClient;
+import java.time.Duration;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -26,11 +27,19 @@ public class MlServiceConfig {
         //    HTTP/1.1'e sabitleyerek çözülüyor.
         HttpClient http1Client = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
+            .connectTimeout(Duration.ofSeconds(3))
             .build();
+
+        // Bağlantı kurulsa bile ml-service hiç yanıt vermezse (donmuş süreç vb.)
+        // çağrı süresiz beklemesin diye okuma timeout'u da ayrı ayarlanıyor —
+        // circuit breaker (bkz. ResilienceConfig) bunu sarmalıyor ama kendisi
+        // senkron çağrıya bir zaman sınırı koymuyor, bu ayrı bir önlem.
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(http1Client);
+        requestFactory.setReadTimeout(Duration.ofSeconds(5));
 
         return RestClient.builder()
             .baseUrl(baseUrl)
-            .requestFactory(new JdkClientHttpRequestFactory(http1Client))
+            .requestFactory(requestFactory)
             .messageConverters(converters -> converters.add(0, new JacksonJsonHttpMessageConverter()))
             .build();
     }
