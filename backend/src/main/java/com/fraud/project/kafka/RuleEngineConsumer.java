@@ -22,7 +22,11 @@ public class RuleEngineConsumer {
         this.ruleEngineService = ruleEngineService;
     }
 
-    @KafkaListener(topics = "${kafka.topic.transactions}", groupId = "fraud-rule-engine")
+    @KafkaListener(
+        topics = "${kafka.topic.transactions}",
+        groupId = "fraud-rule-engine",
+        containerFactory = "ruleEngineKafkaListenerContainerFactory"
+    )
     public void onTransactionEvent(TransactionScoringEvent event) {
         ruleEngineService.evaluate(event.transactionId(), event.features());
     }

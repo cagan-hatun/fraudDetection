@@ -20,7 +20,7 @@ public class TransactionScoringConsumer {
         this.transactionScoringService = transactionScoringService;
     }
 
-    @KafkaListener(topics = "${kafka.topic.transactions}")
+    @KafkaListener(topics = "${kafka.topic.transactions}", containerFactory = "mlScoringKafkaListenerContainerFactory")
     public void onTransactionEvent(TransactionScoringEvent event) {
         transactionScoringService.score(event.transactionId(), event.features());
     }
