@@ -168,4 +168,83 @@ class TransactionReplayServiceTest {
 
         verify(transactionEventProducer).publish(10L, fixture.features());
     }
+
+    private SubmitTransactionRequest ingestRequest(OffsetDateTime transactionTime) {
+        return new SubmitTransactionRequest(
+            "live-user-1",
+            "live-device-1",
+            "Live Merchant",
+            "electronics",
+            new BigDecimal("450.00"),
+            "USD",
+            transactionTime,
+            "US",
+            "Chicago",
+            Map.of("TransactionAmt", 450.0, "ProductCD", "W")
+        );
+    }
+
+    @Test
+    void ingest_newUserDeviceMerchant_createsThem() {
+        when(userRepository.findByExternalRef("live-user-1")).thenReturn(Optional.empty());
+        User savedUser = User.builder().id(2L).externalRef("live-user-1").build();
+        when(userRepository.save(any())).thenReturn(savedUser);
+
+        when(deviceRepository.findByUserAndDeviceFingerprint(savedUser, "live-device-1"))
+            .thenReturn(Optional.empty());
+        Device savedDevice = Device.builder().id(2L).user(savedUser).deviceFingerprint("live-device-1").build();
+        when(deviceRepository.save(any())).thenReturn(savedDevice);
+
+        when(merchantRepository.findByName("Live Merchant")).thenReturn(Optional.empty());
+        Merchant savedMerchant = Merchant.builder().id(2L).name("Live Merchant").category("electronics").build();
+        when(merchantRepository.save(any())).thenReturn(savedMerchant);
+
+        when(transactionRepository.save(any())).thenReturn(Transaction.builder().id(99L).build());
+
+        ReplayAcceptedResult result = replayService.ingest(ingestRequest(OffsetDateTime.parse("2026-01-01T10:00:00Z")));
+
+        verify(userRepository).save(any());
+        verify(deviceRepository).save(any());
+        verify(merchantRepository).save(any());
+
+        assertThat(result.transactionId()).isEqualTo(99L);
+        assertThat(result.status()).isEqualTo(TransactionStatus.PENDING);
+    }
+
+    @Test
+    void ingest_nullTransactionTime_defaultsToNow() {
+        when(userRepository.findByExternalRef(any())).thenReturn(Optional.of(User.builder().id(1L).build()));
+        when(deviceRepository.findByUserAndDeviceFingerprint(any(), any()))
+            .thenReturn(Optional.of(Device.builder().id(1L).build()));
+        when(merchantRepository.findByName(any())).thenReturn(Optional.of(Merchant.builder().id(1L).build()));
+        when(transactionRepository.save(any())).thenReturn(Transaction.builder().id(11L).build());
+
+        OffsetDateTime before = OffsetDateTime.now();
+        replayService.ingest(ingestRequest(null));
+        OffsetDateTime after = OffsetDateTime.now();
+
+        var transactionCaptor = org.mockito.ArgumentCaptor.forClass(Transaction.class);
+        verify(transactionRepository).save(transactionCaptor.capture());
+        OffsetDateTime persistedTime = transactionCaptor.getValue().getTransactionTime();
+
+        assertThat(persistedTime).isBetween(before, after);
+    }
+
+    @Test
+    void ingest_doesNotPublishUntilTransactionCommits() {
+        when(userRepository.findByExternalRef(any())).thenReturn(Optional.of(User.builder().id(1L).build()));
+        when(deviceRepository.findByUserAndDeviceFingerprint(any(), any()))
+            .thenReturn(Optional.of(Device.builder().id(1L).build()));
+        when(merchantRepository.findByName(any())).thenReturn(Optional.of(Merchant.builder().id(1L).build()));
+        when(transactionRepository.save(any())).thenReturn(Transaction.builder().id(12L).build());
+
+        SubmitTransactionRequest request = ingestRequest(OffsetDateTime.parse("2026-01-01T10:00:00Z"));
+        replayService.ingest(request);
+
+        verify(transactionEventProducer, never()).publish(any(), any());
+
+        simulateCommit();
+
+        verify(transactionEventProducer).publish(12L, request.features());
+    }
 }

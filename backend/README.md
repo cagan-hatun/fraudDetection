@@ -72,6 +72,14 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 
 45 test **unit test** (Mockito ile DB/ml-service mock'lanıyor) + 2 **entegrasyon testi** (Testcontainers ile gerçek Postgres + gerçek Kafka'ya karşı): `PostgresPersistenceIntegrationTest` (Flyway migration'larının V1-V3 temiz bir DB'de gerçekten çalıştığını ve `RiskScore.featureSnapshot` gibi jsonb alanların Hibernate ile doğru round-trip ettiğini kanıtlar) ve `KafkaRetryAndDeadLetterIntegrationTest` (`KafkaErrorHandlingConfig`'teki retry+DLQ mekanizmasının gerçek bir broker'a karşı çalıştığını otomatik olarak doğrular — `MlServiceClient` bu testte `@MockitoBean` ile deterministik hata üretecek şekilde değiştiriliyor, ml-service'in kendisine bağımlı olmadan). İkisi de aynı static container çiftini paylaşıyor (bkz. `AbstractIntegrationTest`).
 
+### 7. Gerçek transaction ingestion — `POST /api/transactions`
+
+`/api/demo/replay/{scenarioId}` sadece 7 sabit senaryoyu tetikleyebiliyordu — "gerçek bir ingestion API'si yok" bilinçli bir sınırlılık olarak belgelenmişti. Bunu kapatırken karşılaşılan asıl soru teknik değil, VERİYLE ilgiliydi: `ml/README.md`'deki feature seçimi deneyi, modelin gücünün büyük kısmının IEEE-CIS'in ~100 anonim `V`/`C`/`D` sütunundan geldiğini gösteriyor — sadece "gerçekçi"/formda doldurulabilecek 9 türetilmiş özellikle PR-AUC **0,1377**'ye (rastgele düzeyine) düşüyor. Bu anonim sütunlar orijinal veri setinin nasıl anonimleştirildiği bilinmediği için sıfırdan yeniden hesaplanamaz.
+
+Bu yüzden `POST /api/transactions`, "kullanıcı formdan elle bir işlem girer" MODELİNİ benimsemedi — bunun yerine gerçek sistemlerdeki asıl örüntüyü yansıtıyor: fraud servisi feature'ları kendisi hesaplamaz, ayrı bir feature store/pipeline'dan TAM hesaplanmış olarak alır. Çağıran taraf `SubmitTransactionRequest` ile hem gerçekçi domain alanlarını (merchant/tutar/cihaz/konum, `@Valid` ile doğrulanır) HEM DE tam ~120 sütunluk feature vektörünü sağlıyor; bu noktadan sonra `TransactionReplayService.ingest()`, `replay()` ile AYNI paylaşılan `accept()` metoduna düşüyor — fixture'a özel hiçbir kısayol yok, aynı Kafka→ML+Rules→escalate-only-merge pipeline'ından geçiyor. Canlı doğrulandı: `caught_fraud` fixture'ının feature vektörü farklı domain alanlarıyla (`Live Ingestion Test Merchant`, Denver, $777,77) gönderildi, `/api/demo/replay`'e hiç dokunmadan aynı `BLOCK`/`%99,995` sonucunu üretti.
+
+**Bilinçli olarak yapılmayan:** `amount` (domain, `transactions` tablosuna yazılır) ile `features.TransactionAmt` (modele giden ham değer) arasında otomatik senkronizasyon YOK — tutarlılık çağıranın sorumluluğunda (fixture'larda da aynı ayrım zaten vardı, yeni bir tutarsızlık değil).
+
 ## Veritabanı Şeması
 
 | Tablo | Amaç |
@@ -94,6 +102,7 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 | `GET /api/demo/transactions/{id}` | Bearer JWT | Polling için hafif durum sorgusu — `PENDING` ya da `SCORED` + `fraudProbability/action/modelVersion` (`action` = ML+Rule Engine'in nihai/escalate edilmiş kararı) |
 | `GET /api/demo/transactions/{id}/detail` | Bearer JWT | İşlem Detayı sayfası için tek seferlik, zengin cevap — merchant/tutar/konum + ML kararı + Rule Engine kararı + nihai karar + tüm SHAP katkıları + varsa analist kararı. Polling uç noktasından bilinçli olarak ayrı (her 1.5sn'de SHAP çekmek gereksiz yük olurdu) |
 | `POST /api/demo/transactions/{id}/review` | Bearer JWT | Bir analistin REVIEW durumundaki bir işlem için kararı (`{decision, note}`). Sadece nihai karar REVIEW ise kabul edilir, aksi halde `409 Conflict`. `reviewedBy` istemciden değil, JWT'deki kimlikten alınır |
+| `POST /api/transactions` | Bearer JWT | `/api/demo/**`'den bilinçli olarak AYRI — sabit bir fixture'a bakmaz, çağıran TAM ~120 sütunluk feature vektörünü kendisi sağlar (bkz. aşağıdaki "Gerçek transaction ingestion" bölümü). `@Valid` ile alan bazlı doğrulama (`400` + RFC 7807 hatalı istekte), sonrası `/replay` ile AYNI gerçek pipeline (Kafka→ML+Rules→escalate-only merge) |
 
 ## Çalıştırma
 
@@ -132,20 +141,20 @@ curl -H "Authorization: Bearer $TOKEN" \
 ./mvnw test
 ```
 
-55 test. 53'ü unit test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu, `getDetail`'in PENDING/SCORED/analist kararı durumları, `submitReview`'ın durum validasyonu + üzerine yazma davranışı), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`, `GlobalExceptionHandlerTest`, `ResilienceConfigTest` (circuit breaker'ın gerçekten CLOSED→OPEN geçtiğini ve OPEN'ken çağrıyı anında reddettiğini doğrular). 2'si Testcontainers ile gerçek Postgres+Kafka'ya karşı çalışan entegrasyon testi (Docker gerektirir, ~30sn) — bkz. yukarıdaki Test Stratejisi.
+58 test. 56'sı unit test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı, `ingest()`'in `transactionTime` verilmezse şimdiki zamana varsayılan gelmesi), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu, `getDetail`'in PENDING/SCORED/analist kararı durumları, `submitReview`'ın durum validasyonu + üzerine yazma davranışı), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`, `GlobalExceptionHandlerTest`, `ResilienceConfigTest` (circuit breaker'ın gerçekten CLOSED→OPEN geçtiğini ve OPEN'ken çağrıyı anında reddettiğini doğrular). 2'si Testcontainers ile gerçek Postgres+Kafka'ya karşı çalışan entegrasyon testi (Docker gerektirir, ~30sn) — bkz. yukarıdaki Test Stratejisi.
 
 **Uçtan uca doğrulama notu:** İlk 6 demo fixture'ının hiçbiri gerçek kural eşiklerini (>$5000, yeni cihaz+>$1000, merchant_risk>0.5) tetiklemiyordu — bu yüzden escalation'ı canlı göstermek için önce `rules.yaml`'daki bir eşik geçici olarak düşürülüp test edildi, sonra geri alındı. Kalıcı çözüm olarak IEEE-CIS holdout setinde bu eşiklere GERÇEKTEN uyan bir satır arandı ve bulundu: `rule_escalation` fixture'ı (`$1.500`, yeni cihaz, gerçekte fraud değil) — ML tek başına `%0,005` olasılıkla APPROVE diyor, ama Rule Engine'in `new_device_meaningful_amount` kuralı REVIEW'a yükseltiyor. Eşik hackleme olmadan, gerçek veriyle, kalıcı olarak doğrulanabiliyor.
 
 ## Bilinen Sınırlılıklar / Sıradaki Adımlar
 
-Aşağıdaki dört madde kapatıldı:
+Aşağıdaki beş madde kapatıldı:
 
 - ✅ **Global exception handler** — `exception/GlobalExceptionHandler.java`, tüm hatalar (bizimkiler + Spring'in framework hataları) RFC 7807 `ProblemDetail` formatında dönüyor, stack trace client'a sızmıyor.
 - ✅ **Kafka retry/DLQ** — `config/KafkaErrorHandlingConfig.java`, her consumer group için ayrı hata yönetimi (3 deneme + 1sn backoff, sonra group'a özel bir Dead Letter Topic: `transactions.fraud-backend.DLT` / `transactions.fraud-rule-engine.DLT`).
 - ✅ **Resilience4j** — `config/ResilienceConfig.java`, ml-service çağrıları etrafında circuit breaker (kasıtlı olarak retry yok, Kafka'nın kendi retry'ıyla çakışmasın diye; fallback yok, DLQ zaten güvenlik ağı).
 - ✅ **Testcontainers** — `PostgresPersistenceIntegrationTest` ve `KafkaRetryAndDeadLetterIntegrationTest`, gerçek Postgres+Kafka container'larına karşı çalışıyor.
+- ✅ **Gerçek transaction ingestion API'si** — `POST /api/transactions`, bkz. yukarıdaki "Gerçek transaction ingestion" bölümü. Sabit fixture'lara bağımlı olmayan, çağıranın kendi feature vektörünü sağladığı ve AYNI gerçek pipeline'dan geçen bir uç nokta.
 
 Kalan bilinçli sınırlılık:
 
-- **Gerçek transaction ingestion API'si yok** — şu an sadece önceden tanımlı 7 demo senaryosu "replay" edilebiliyor, keyfi bir işlem submit edilemiyor (bilinçli — bkz. yukarıdaki fixture kararı, IEEE-CIS'in anonim sütunları serbest girişle doldurulamaz).
 - **DLQ'ya düşen mesajlar için bir redrive/yeniden işleme aracı yok** — bilinçli olarak kapsam dışı bırakıldı (portfolyo projesi ölçeğinde gereksiz); DLQ'ya düşen bir transaction kalıcı olarak `PENDING` kalır.

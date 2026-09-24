@@ -4,6 +4,22 @@
  */
 
 export interface paths {
+    "/api/transactions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["submit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/demo/transactions/{id}/review": {
         parameters: {
             query?: never;
@@ -104,6 +120,27 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        SubmitTransactionRequest: {
+            userExternalRef: string;
+            deviceFingerprint: string;
+            merchantName: string;
+            merchantCategory?: string;
+            amount: number;
+            currency: string;
+            /** Format: date-time */
+            transactionTime?: string;
+            locationCountry: string;
+            locationCity: string;
+            features: {
+                [key: string]: unknown;
+            };
+        };
+        ReplayAcceptedResult: {
+            /** Format: int64 */
+            transactionId?: number;
+            /** @enum {string} */
+            status?: "PENDING" | "SCORED";
+        };
         SubmitReviewRequest: {
             /** @enum {string} */
             decision?: "APPROVED" | "REJECTED";
@@ -116,12 +153,6 @@ export interface components {
             reviewedBy?: string;
             /** Format: date-time */
             reviewedAt?: string;
-        };
-        ReplayAcceptedResult: {
-            /** Format: int64 */
-            transactionId?: number;
-            /** @enum {string} */
-            status?: "PENDING" | "SCORED";
         };
         LoginRequest: {
             username?: string;
@@ -187,6 +218,30 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    submit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SubmitTransactionRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["ReplayAcceptedResult"];
+                };
+            };
+        };
+    };
     submitReview: {
         parameters: {
             query?: never;

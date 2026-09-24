@@ -1,5 +1,8 @@
 package com.fraud.project.service;
 
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
+import java.util.Map;
 import java.util.NoSuchElementException;
 
 import org.springframework.stereotype.Service;
@@ -62,19 +65,71 @@ public class TransactionReplayService {
         DemoTransactionFixture fixture = fixtureLoader.findByScenarioId(scenarioId)
             .orElseThrow(() -> new NoSuchElementException("Bilinmeyen demo senaryosu: " + scenarioId));
 
-        User user = findOrCreateUser(fixture.userExternalRef());
-        Device device = findOrCreateDevice(user, fixture.deviceFingerprint());
-        Merchant merchant = findOrCreateMerchant(fixture.merchantName(), fixture.merchantCategory());
+        return accept(
+            fixture.userExternalRef(),
+            fixture.deviceFingerprint(),
+            fixture.merchantName(),
+            fixture.merchantCategory(),
+            fixture.amount(),
+            fixture.currency(),
+            fixture.transactionTime(),
+            fixture.locationCountry(),
+            fixture.locationCity(),
+            fixture.features()
+        );
+    }
+
+    /**
+     * `replay`'den farklı olarak sabit bir fixture'a değil, çağıranın kendi
+     * gönderdiği tam feature vektörüne dayanır (bkz. SubmitTransactionRequest'in
+     * javadoc'u) — ama sonrasında AYNI gerçek pipeline'dan (Kafka→ML+Rules→
+     * escalate-only merge) geçer, demo'ya özel bir kısayol YOKTUR.
+     */
+    @Transactional
+    public ReplayAcceptedResult ingest(SubmitTransactionRequest request) {
+        OffsetDateTime transactionTime = request.transactionTime() != null
+            ? request.transactionTime()
+            : OffsetDateTime.now();
+
+        return accept(
+            request.userExternalRef(),
+            request.deviceFingerprint(),
+            request.merchantName(),
+            request.merchantCategory(),
+            request.amount(),
+            request.currency(),
+            transactionTime,
+            request.locationCountry(),
+            request.locationCity(),
+            request.features()
+        );
+    }
+
+    private ReplayAcceptedResult accept(
+        String userExternalRef,
+        String deviceFingerprint,
+        String merchantName,
+        String merchantCategory,
+        BigDecimal amount,
+        String currency,
+        OffsetDateTime transactionTime,
+        String locationCountry,
+        String locationCity,
+        Map<String, Object> features
+    ) {
+        User user = findOrCreateUser(userExternalRef);
+        Device device = findOrCreateDevice(user, deviceFingerprint);
+        Merchant merchant = findOrCreateMerchant(merchantName, merchantCategory);
 
         Transaction transaction = transactionRepository.save(Transaction.builder()
             .user(user)
             .device(device)
             .merchant(merchant)
-            .amount(fixture.amount())
-            .currency(fixture.currency())
-            .transactionTime(fixture.transactionTime())
-            .locationCountry(fixture.locationCountry())
-            .locationCity(fixture.locationCity())
+            .amount(amount)
+            .currency(currency)
+            .transactionTime(transactionTime)
+            .locationCountry(locationCountry)
+            .locationCity(locationCity)
             .build());
 
         // KRİTİK: publish'i doğrudan burada YAPMIYORUZ. Bu metod hâlâ
@@ -86,7 +141,6 @@ public class TransactionReplayService {
         // TransactionSynchronizationManager ile transaction COMMIT OLDUKTAN
         // SONRA çalışacak şekilde erteliyoruz.
         Long transactionId = transaction.getId();
-        var features = fixture.features();
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
