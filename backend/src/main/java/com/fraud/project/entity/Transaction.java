@@ -60,6 +60,10 @@ public class Transaction {
     @Column(name = "location_city", length = 100)
     private String locationCity;
 
+    /** Sadece `POST /api/transactions` doldurur — demo replay akışı hiç set etmez. */
+    @Column(name = "idempotency_key", unique = true)
+    private String idempotencyKey;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;

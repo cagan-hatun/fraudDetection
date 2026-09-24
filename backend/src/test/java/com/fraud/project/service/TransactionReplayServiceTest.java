@@ -32,6 +32,7 @@ import com.fraud.project.fixture.DemoTransactionFixture;
 import com.fraud.project.kafka.TransactionEventProducer;
 import com.fraud.project.repository.DeviceRepository;
 import com.fraud.project.repository.MerchantRepository;
+import com.fraud.project.repository.RiskScoreRepository;
 import com.fraud.project.repository.TransactionRepository;
 import com.fraud.project.repository.UserRepository;
 
@@ -43,6 +44,7 @@ class TransactionReplayServiceTest {
     @Mock private DeviceRepository deviceRepository;
     @Mock private MerchantRepository merchantRepository;
     @Mock private TransactionRepository transactionRepository;
+    @Mock private RiskScoreRepository riskScoreRepository;
     @Mock private TransactionEventProducer transactionEventProducer;
 
     @InjectMocks
@@ -201,7 +203,7 @@ class TransactionReplayServiceTest {
 
         when(transactionRepository.save(any())).thenReturn(Transaction.builder().id(99L).build());
 
-        ReplayAcceptedResult result = replayService.ingest(ingestRequest(OffsetDateTime.parse("2026-01-01T10:00:00Z")));
+        ReplayAcceptedResult result = replayService.ingest(ingestRequest(OffsetDateTime.parse("2026-01-01T10:00:00Z")), null);
 
         verify(userRepository).save(any());
         verify(deviceRepository).save(any());
@@ -220,7 +222,7 @@ class TransactionReplayServiceTest {
         when(transactionRepository.save(any())).thenReturn(Transaction.builder().id(11L).build());
 
         OffsetDateTime before = OffsetDateTime.now();
-        replayService.ingest(ingestRequest(null));
+        replayService.ingest(ingestRequest(null), null);
         OffsetDateTime after = OffsetDateTime.now();
 
         var transactionCaptor = org.mockito.ArgumentCaptor.forClass(Transaction.class);
@@ -239,12 +241,56 @@ class TransactionReplayServiceTest {
         when(transactionRepository.save(any())).thenReturn(Transaction.builder().id(12L).build());
 
         SubmitTransactionRequest request = ingestRequest(OffsetDateTime.parse("2026-01-01T10:00:00Z"));
-        replayService.ingest(request);
+        replayService.ingest(request, null);
 
         verify(transactionEventProducer, never()).publish(any(), any());
 
         simulateCommit();
 
         verify(transactionEventProducer).publish(12L, request.features());
+    }
+
+    @Test
+    void ingest_newIdempotencyKey_createsTransactionAndStoresKeyOnIt() {
+        when(userRepository.findByExternalRef(any())).thenReturn(Optional.of(User.builder().id(1L).build()));
+        when(deviceRepository.findByUserAndDeviceFingerprint(any(), any()))
+            .thenReturn(Optional.of(Device.builder().id(1L).build()));
+        when(merchantRepository.findByName(any())).thenReturn(Optional.of(Merchant.builder().id(1L).build()));
+        when(transactionRepository.findByIdempotencyKey("key-abc")).thenReturn(Optional.empty());
+        when(transactionRepository.save(any())).thenReturn(Transaction.builder().id(20L).build());
+
+        ReplayAcceptedResult result = replayService.ingest(ingestRequest(OffsetDateTime.now()), "key-abc");
+
+        assertThat(result.transactionId()).isEqualTo(20L);
+        var transactionCaptor = org.mockito.ArgumentCaptor.forClass(Transaction.class);
+        verify(transactionRepository).save(transactionCaptor.capture());
+        assertThat(transactionCaptor.getValue().getIdempotencyKey()).isEqualTo("key-abc");
+    }
+
+    @Test
+    void ingest_reusedIdempotencyKey_returnsExistingTransactionWithoutCreatingANewOne() {
+        Transaction existing = Transaction.builder().id(20L).build();
+        when(transactionRepository.findByIdempotencyKey("key-abc")).thenReturn(Optional.of(existing));
+        when(riskScoreRepository.findByTransactionId(20L)).thenReturn(Optional.empty());
+
+        ReplayAcceptedResult result = replayService.ingest(ingestRequest(OffsetDateTime.now()), "key-abc");
+
+        assertThat(result).isEqualTo(new ReplayAcceptedResult(20L, TransactionStatus.PENDING));
+        verify(transactionRepository, never()).save(any());
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    void ingest_reusedIdempotencyKey_reflectsScoredStatusIfAlreadyFinalized() {
+        Transaction existing = Transaction.builder().id(21L).build();
+        when(transactionRepository.findByIdempotencyKey("key-scored")).thenReturn(Optional.of(existing));
+        var riskScore = com.fraud.project.entity.RiskScore.builder()
+            .finalAction(com.fraud.project.entity.RiskAction.APPROVE)
+            .build();
+        when(riskScoreRepository.findByTransactionId(21L)).thenReturn(Optional.of(riskScore));
+
+        ReplayAcceptedResult result = replayService.ingest(ingestRequest(OffsetDateTime.now()), "key-scored");
+
+        assertThat(result).isEqualTo(new ReplayAcceptedResult(21L, TransactionStatus.SCORED));
     }
 }

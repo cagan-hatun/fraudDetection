@@ -19,6 +19,7 @@ import com.fraud.project.fixture.DemoTransactionFixture;
 import com.fraud.project.kafka.TransactionEventProducer;
 import com.fraud.project.repository.DeviceRepository;
 import com.fraud.project.repository.MerchantRepository;
+import com.fraud.project.repository.RiskScoreRepository;
 import com.fraud.project.repository.TransactionRepository;
 import com.fraud.project.repository.UserRepository;
 
@@ -42,6 +43,7 @@ public class TransactionReplayService {
     private final DeviceRepository deviceRepository;
     private final MerchantRepository merchantRepository;
     private final TransactionRepository transactionRepository;
+    private final RiskScoreRepository riskScoreRepository;
     private final TransactionEventProducer transactionEventProducer;
 
     public TransactionReplayService(
@@ -50,6 +52,7 @@ public class TransactionReplayService {
         DeviceRepository deviceRepository,
         MerchantRepository merchantRepository,
         TransactionRepository transactionRepository,
+        RiskScoreRepository riskScoreRepository,
         TransactionEventProducer transactionEventProducer
     ) {
         this.fixtureLoader = fixtureLoader;
@@ -57,6 +60,7 @@ public class TransactionReplayService {
         this.deviceRepository = deviceRepository;
         this.merchantRepository = merchantRepository;
         this.transactionRepository = transactionRepository;
+        this.riskScoreRepository = riskScoreRepository;
         this.transactionEventProducer = transactionEventProducer;
     }
 
@@ -75,7 +79,8 @@ public class TransactionReplayService {
             fixture.transactionTime(),
             fixture.locationCountry(),
             fixture.locationCity(),
-            fixture.features()
+            fixture.features(),
+            null
         );
     }
 
@@ -84,9 +89,28 @@ public class TransactionReplayService {
      * gönderdiği tam feature vektörüne dayanır (bkz. SubmitTransactionRequest'in
      * javadoc'u) — ama sonrasında AYNI gerçek pipeline'dan (Kafka→ML+Rules→
      * escalate-only merge) geçer, demo'ya özel bir kısayol YOKTUR.
+     *
+     * `idempotencyKey` (client'ın `Idempotency-Key` header'ından, opsiyonel):
+     * daha önce AYNI key ile bir çağrı yapılmışsa, YENİ bir transaction
+     * YARATILMAZ — var olanın id'si + güncel durumu döner. Bir ağ hatası
+     * sonrası client'ın isteği güvenle retry edebilmesi için.
      */
     @Transactional
-    public ReplayAcceptedResult ingest(SubmitTransactionRequest request) {
+    public ReplayAcceptedResult ingest(SubmitTransactionRequest request, String idempotencyKey) {
+        // Bilinen sınırlılık: check-then-insert, gerçek eşzamanlı iki istek
+        // (AYNI key, ikisi de bu satırı aynı anda geçerse) arasında bir yarış
+        // içeriyor — DB'nin UNIQUE kısıtlaması ikinci insert'i reddeder ama
+        // onu burada zarifçe yakalayıp tekrar sorgulamıyoruz. Portfolyo
+        // ölçeğinde (tek client, retry senaryosu ardışık) kabul edilebilir;
+        // gerçek eşzamanlı çağrı riski varsa bu bir DB-seviyeli upsert'e
+        // taşınmalı.
+        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+            var existing = transactionRepository.findByIdempotencyKey(idempotencyKey);
+            if (existing.isPresent()) {
+                return new ReplayAcceptedResult(existing.get().getId(), statusOf(existing.get().getId()));
+            }
+        }
+
         OffsetDateTime transactionTime = request.transactionTime() != null
             ? request.transactionTime()
             : OffsetDateTime.now();
@@ -101,8 +125,16 @@ public class TransactionReplayService {
             transactionTime,
             request.locationCountry(),
             request.locationCity(),
-            request.features()
+            request.features(),
+            idempotencyKey
         );
+    }
+
+    private TransactionStatus statusOf(Long transactionId) {
+        return riskScoreRepository.findByTransactionId(transactionId)
+            .filter(riskScore -> riskScore.getFinalAction() != null)
+            .map(riskScore -> TransactionStatus.SCORED)
+            .orElse(TransactionStatus.PENDING);
     }
 
     private ReplayAcceptedResult accept(
@@ -115,7 +147,8 @@ public class TransactionReplayService {
         OffsetDateTime transactionTime,
         String locationCountry,
         String locationCity,
-        Map<String, Object> features
+        Map<String, Object> features,
+        String idempotencyKey
     ) {
         User user = findOrCreateUser(userExternalRef);
         Device device = findOrCreateDevice(user, deviceFingerprint);
@@ -130,6 +163,7 @@ public class TransactionReplayService {
             .transactionTime(transactionTime)
             .locationCountry(locationCountry)
             .locationCity(locationCity)
+            .idempotencyKey(idempotencyKey)
             .build());
 
         // KRİTİK: publish'i doğrudan burada YAPMIYORUZ. Bu metod hâlâ

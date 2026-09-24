@@ -62,7 +62,7 @@ services:
       kafka:
         condition: service_started
       ml-service:
-        condition: service_started
+        condition: service_healthy
     environment:
       # application.properties'teki host-modu varsayılanlarının (localhost:5433,
       # localhost:9092, 127.0.0.1:8000) hepsini container ağı adresleriyle
@@ -85,7 +85,8 @@ services:
     ports:
       - "5173:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:

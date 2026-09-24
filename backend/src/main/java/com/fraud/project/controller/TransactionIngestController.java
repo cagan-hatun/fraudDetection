@@ -4,6 +4,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -30,10 +31,18 @@ public class TransactionIngestController {
         this.replayService = replayService;
     }
 
-    /** Asenkron: transaction hemen kaydedilir, skorlama Kafka üzerinden arka planda olur. */
+    /**
+     * Asenkron: transaction hemen kaydedilir, skorlama Kafka üzerinden arka
+     * planda olur. `Idempotency-Key` opsiyonel — verilirse ve daha önce AYNI
+     * key'le bir istek yapılmışsa, yeni bir transaction yaratmak yerine
+     * var olanın durumu döner (bkz. TransactionReplayService.ingest javadoc'u).
+     */
     @PostMapping
-    public ResponseEntity<ReplayAcceptedResult> submit(@Valid @RequestBody SubmitTransactionRequest request) {
-        ReplayAcceptedResult result = replayService.ingest(request);
+    public ResponseEntity<ReplayAcceptedResult> submit(
+        @Valid @RequestBody SubmitTransactionRequest request,
+        @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
+    ) {
+        ReplayAcceptedResult result = replayService.ingest(request, idempotencyKey);
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(result);
     }
 }

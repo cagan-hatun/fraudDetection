@@ -18,6 +18,7 @@ import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import com.fraud.project.security.JwtAuthenticationFilter;
+import com.fraud.project.security.LoginRateLimitFilter;
 
 /**
  * JWT ile stateless kimlik doğrulama: `/api/auth/login` herkese açık, geri
@@ -40,8 +41,11 @@ public class SecurityConfig {
     }
 
     @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http, JwtAuthenticationFilter jwtAuthenticationFilter)
-        throws Exception {
+    public SecurityFilterChain filterChain(
+        HttpSecurity http,
+        JwtAuthenticationFilter jwtAuthenticationFilter,
+        LoginRateLimitFilter loginRateLimitFilter
+    ) throws Exception {
         return http
             .csrf(csrf -> csrf.disable())
             .cors(cors -> cors.configurationSource(corsConfigurationSource))
@@ -49,12 +53,18 @@ public class SecurityConfig {
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers("/api/auth/**").permitAll()
                 .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
+                // Health check'ler (Docker healthcheck, orchestrator readiness/liveness
+                // probe'ları) kimlik doğrulaması OLMADAN çağrılır — bu yüzden diğer her
+                // şeyden farklı olarak açık. Actuator'ın kendisi zaten sadece health+info'yu
+                // dışa açıyor (application.properties), env/beans gibi hassas uç noktalar yok.
+                .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/info").permitAll()
                 // DLQ redrive gibi altyapı kurtarma işlemleri bir analistin değil, bir
                 // operasyon/altyapı sorumlusunun yapacağı bir iş — bu yüzden projede
                 // ilk kez rol bazlı bir ayrım burada devreye giriyor.
                 .requestMatchers("/api/admin/**").hasRole("ADMIN")
                 .anyRequest().authenticated())
             .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+            .addFilterBefore(loginRateLimitFilter, JwtAuthenticationFilter.class)
             .build();
     }
 
