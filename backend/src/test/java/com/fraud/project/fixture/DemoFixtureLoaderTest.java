@@ -70,18 +70,19 @@ class DemoFixtureLoaderTest {
     }
 
     @Test
-    void realFixtureFile_loadsSixHoldoutScenariosWithFullFeatureVectors() {
+    void realFixtureFile_loadsSevenHoldoutScenariosWithFullFeatureVectors() {
         // Gerçek üretim dosyasını (fixtures/demo_transactions.json) DemoFixtureLoader
         // constructor'ı ÜZERİNDEN yüklüyoruz — Spring context'i ayağa kaldırmadan,
         // ama gerçek ClassPathResource/dosya okuma yolunu da test ederek.
         DemoFixtureLoader loader = new DemoFixtureLoader(testObjectMapper());
 
-        assertThat(loader.findAll()).hasSize(6);
+        assertThat(loader.findAll()).hasSize(7);
         assertThat(loader.findAll())
             .extracting(DemoTransactionFixture::scenarioId)
             .containsExactlyInAnyOrder(
                 "caught_fraud", "missed_fraud", "false_positive",
-                "ordinary_small", "ordinary_medium", "ordinary_large"
+                "ordinary_small", "ordinary_medium", "ordinary_large",
+                "rule_escalation"
             );
 
         DemoTransactionFixture caughtFraud = loader.findByScenarioId("caught_fraud").orElseThrow();
@@ -95,5 +96,16 @@ class DemoFixtureLoaderTest {
 
         DemoTransactionFixture falsePositive = loader.findByScenarioId("false_positive").orElseThrow();
         assertThat(falsePositive.groundTruthIsFraud()).isFalse();
+
+        // rule_escalation: gerçek, fraud OLMAYAN bir holdout satırı — ML tek
+        // başına APPROVE diyor (bkz. backend README), ama Rule Engine'in
+        // "yeni cihaz + $1000 üzeri tutar" kuralı REVIEW'a yükseltiyor. Diğer
+        // 6 fixture hiçbir kuralı tetiklemediği için REVIEW akışını canlı
+        // göstermenin tek yolu buydu.
+        DemoTransactionFixture ruleEscalation = loader.findByScenarioId("rule_escalation").orElseThrow();
+        assertThat(ruleEscalation.groundTruthIsFraud()).isFalse();
+        assertThat(ruleEscalation.features()).hasSize(120);
+        assertThat(ruleEscalation.features().get("new_device")).isEqualTo(true);
+        assertThat(ruleEscalation.features().get("TransactionAmt")).isEqualTo(1500.0);
     }
 }

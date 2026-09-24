@@ -1,23 +1,30 @@
 package com.fraud.project.service;
 
 import java.math.BigDecimal;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.fraud.project.entity.AnalystReview;
 import com.fraud.project.entity.AuditLog;
 import com.fraud.project.entity.Explanation;
+import com.fraud.project.entity.RiskAction;
 import com.fraud.project.entity.RiskScore;
+import com.fraud.project.entity.RuleEvaluation;
 import com.fraud.project.entity.Transaction;
 import com.fraud.project.mlservice.ExplanationResult;
 import com.fraud.project.mlservice.MlServiceClient;
 import com.fraud.project.mlservice.PredictionResult;
+import com.fraud.project.repository.AnalystReviewRepository;
 import com.fraud.project.repository.AuditLogRepository;
 import com.fraud.project.repository.ExplanationRepository;
 import com.fraud.project.repository.RiskScoreRepository;
+import com.fraud.project.repository.RuleEvaluationRepository;
 import com.fraud.project.repository.TransactionRepository;
 
 /**
@@ -36,6 +43,8 @@ public class TransactionScoringService {
     private final RiskScoreRepository riskScoreRepository;
     private final ExplanationRepository explanationRepository;
     private final AuditLogRepository auditLogRepository;
+    private final RuleEvaluationRepository ruleEvaluationRepository;
+    private final AnalystReviewRepository analystReviewRepository;
     private final MlServiceClient mlServiceClient;
     private final RiskFinalizationService riskFinalizationService;
 
@@ -44,6 +53,8 @@ public class TransactionScoringService {
         RiskScoreRepository riskScoreRepository,
         ExplanationRepository explanationRepository,
         AuditLogRepository auditLogRepository,
+        RuleEvaluationRepository ruleEvaluationRepository,
+        AnalystReviewRepository analystReviewRepository,
         MlServiceClient mlServiceClient,
         RiskFinalizationService riskFinalizationService
     ) {
@@ -51,6 +62,8 @@ public class TransactionScoringService {
         this.riskScoreRepository = riskScoreRepository;
         this.explanationRepository = explanationRepository;
         this.auditLogRepository = auditLogRepository;
+        this.ruleEvaluationRepository = ruleEvaluationRepository;
+        this.analystReviewRepository = analystReviewRepository;
         this.mlServiceClient = mlServiceClient;
         this.riskFinalizationService = riskFinalizationService;
     }
@@ -71,6 +84,9 @@ public class TransactionScoringService {
             .build());
 
         ExplanationResult explanation = mlServiceClient.explain(features);
+        riskScore.setBaseValue(BigDecimal.valueOf(explanation.baseValue()));
+        riskScoreRepository.save(riskScore);
+
         List<Explanation> explanations = explanation.contributions().stream()
             .map(contribution -> Explanation.builder()
                 .riskScore(riskScore)
@@ -115,5 +131,87 @@ public class TransactionScoringService {
             .orElseGet(() -> new TransactionStatusResult(
                 transactionId, TransactionStatus.PENDING, null, null, null
             ));
+    }
+
+    /**
+     * İşlem Detayı sayfası için tek seferlik, zengin sorgu — polling'in
+     * kullandığı getStatus()'tan AYRI, çünkü her 1.5sn'de bir SHAP/rule
+     * verisini de çekmek gereksiz yük olurdu. PENDING durumunda ML/Rule
+     * Engine/SHAP alanları henüz yoktur, null/boş döner.
+     */
+    @Transactional(readOnly = true)
+    public TransactionDetailResult getDetail(Long transactionId) {
+        Transaction transaction = transactionRepository.findById(transactionId)
+            .orElseThrow(() -> new NoSuchElementException("Bilinmeyen transaction: " + transactionId));
+
+        Optional<RiskScore> riskScoreOpt = riskScoreRepository.findByTransactionId(transactionId);
+        Optional<RuleEvaluation> ruleEvaluationOpt = ruleEvaluationRepository.findByTransactionId(transactionId);
+
+        boolean isFinalized = riskScoreOpt.map(rs -> rs.getFinalAction() != null).orElse(false);
+
+        List<ShapContribution> shapContributions = riskScoreOpt
+            .map(rs -> explanationRepository.findByRiskScoreIdOrderByAbsShapValueDesc(rs.getId()).stream()
+                .map(e -> new ShapContribution(e.getFeatureName(), e.getFeatureValue(), e.getShapValue()))
+                .toList())
+            .orElse(List.of());
+
+        AnalystReviewSummary analystReview = analystReviewRepository.findByTransactionId(transactionId)
+            .map(r -> new AnalystReviewSummary(r.getDecision(), r.getNote(), r.getReviewedBy(), r.getReviewedAt()))
+            .orElse(null);
+
+        return new TransactionDetailResult(
+            transactionId,
+            isFinalized ? TransactionStatus.SCORED : TransactionStatus.PENDING,
+            transaction.getAmount(),
+            transaction.getCurrency(),
+            transaction.getTransactionTime(),
+            transaction.getLocationCountry(),
+            transaction.getLocationCity(),
+            transaction.getMerchant().getName(),
+            transaction.getMerchant().getCategory(),
+            transaction.getUser().getExternalRef(),
+            transaction.getDevice().getDeviceFingerprint(),
+            riskScoreOpt.map(RiskScore::getFraudProbability).orElse(null),
+            riskScoreOpt.map(RiskScore::getAction).orElse(null),
+            riskScoreOpt.map(RiskScore::getModelVersion).orElse(null),
+            riskScoreOpt.map(RiskScore::getBaseValue).orElse(null),
+            shapContributions,
+            ruleEvaluationOpt.map(RuleEvaluation::getAction).orElse(null),
+            ruleEvaluationOpt.map(RuleEvaluation::getMatchedRules).orElse(null),
+            isFinalized ? riskScoreOpt.get().getFinalAction() : null,
+            analystReview
+        );
+    }
+
+    /**
+     * Bir analistin REVIEW durumundaki bir işlem için karar vermesi. Sadece
+     * final karar REVIEW ise izin verilir — APPROVE/BLOCK zaten netleşmiş bir
+     * işlemi "review etmek" anlamsız. Aynı işlem için ikinci bir çağrı,
+     * önceki kararın ÜZERİNE YAZAR (analist fikrini değiştirebilir).
+     */
+    @Transactional
+    public AnalystReviewSummary submitReview(Long transactionId, String reviewedBy, SubmitReviewRequest request) {
+        Transaction transaction = transactionRepository.findById(transactionId)
+            .orElseThrow(() -> new NoSuchElementException("Bilinmeyen transaction: " + transactionId));
+
+        RiskAction finalAction = riskScoreRepository.findByTransactionId(transactionId)
+            .map(RiskScore::getFinalAction)
+            .orElse(null);
+
+        if (finalAction != RiskAction.REVIEW) {
+            throw new InvalidReviewStateException(
+                "İşlem #" + transactionId + " şu an REVIEW durumunda değil (nihai karar: " + finalAction + ")");
+        }
+
+        AnalystReview review = analystReviewRepository.findByTransactionId(transactionId)
+            .orElseGet(() -> AnalystReview.builder().transaction(transaction).build());
+
+        review.setDecision(request.decision());
+        review.setNote(request.note());
+        review.setReviewedBy(reviewedBy);
+        review.setReviewedAt(OffsetDateTime.now());
+
+        AnalystReview saved = analystReviewRepository.save(review);
+        return new AnalystReviewSummary(saved.getDecision(), saved.getNote(), saved.getReviewedBy(), saved.getReviewedAt());
     }
 }

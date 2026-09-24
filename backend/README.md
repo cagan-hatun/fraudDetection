@@ -38,7 +38,7 @@ ML modeli IEEE-CIS'in 120 ham/anonim sütunuyla (`V1-339`, `C1-14`, `D1-15`... �
 
 ### 2. Demo veriler DB'ye seed edilmiyor, JSON fixture olarak duruyor
 
-`fixtures/demo_transactions.json`, IEEE-CIS holdout setinden (modele hiç karışmamış, gerçek etiketli) seçilmiş 6 gerçek satır içeriyor: `caught_fraud` (doğru yakalanan), `missed_fraud` (kaçırılan — modelin kör noktası), `false_positive` (yanlış alarm), `ordinary_small/medium/large`. Bilinçli bir tasarım kararı: veritabanı pipeline'ın ÇIKTISI olmalı, GİRDİSİ değil — fixture'lar DB'ye önceden yazılsaydı `replay` endpoint'inin "sıfırdan gerçekten çalıştığını" göstermenin bir anlamı kalmazdı. Anonim sütunlar (V/C/D...) sentetik ÜRETİLMEDİ — istatistiksel örnekleme modelin asıl sinyalini gürültüye çevirirdi, bu yüzden gerçek holdout satırları kullanıldı.
+`fixtures/demo_transactions.json`, IEEE-CIS holdout setinden (modele hiç karışmamış, gerçek etiketli) seçilmiş 7 gerçek satır içeriyor: `caught_fraud` (doğru yakalanan), `missed_fraud` (kaçırılan — modelin kör noktası), `false_positive` (yanlış alarm), `ordinary_small/medium/large`, `rule_escalation` (ML tek başına APPROVE diyor ama Rule Engine'in "yeni cihaz + $1000 üzeri tutar" kuralı REVIEW'a yükseltiyor — bkz. aşağıdaki "Uçtan uca doğrulama notu"). Bilinçli bir tasarım kararı: veritabanı pipeline'ın ÇIKTISI olmalı, GİRDİSİ değil — fixture'lar DB'ye önceden yazılsaydı `replay` endpoint'inin "sıfırdan gerçekten çalıştığını" göstermenin bir anlamı kalmazdı. Anonim sütunlar (V/C/D...) sentetik ÜRETİLMEDİ — istatistiksel örnekleme modelin asıl sinyalini gürültüye çevirirdi, bu yüzden gerçek holdout satırları kullanıldı.
 
 ### 3. Asenkron akış: iki BAĞIMSIZ paralel Kafka consumer'ı + escalate-only birleştirme
 
@@ -77,11 +77,12 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 | Tablo | Amaç |
 |---|---|
 | `users`, `devices`, `merchants`, `transactions` | Gerçekçi bankacılık domain'i |
-| `risk_scores` | `action` = SAF ML kararı, `final_action` = ML+Rule Engine escalate-only birleşimi (ikisi bitene kadar NULL), `feature_snapshot` (JSONB) |
+| `risk_scores` | `action` = SAF ML kararı, `final_action` = ML+Rule Engine escalate-only birleşimi (ikisi bitene kadar NULL), `feature_snapshot` (JSONB), `base_value` (SHAP taban değeri) |
 | `rule_evaluations` | Rule Engine'in ML'den bağımsız kendi kararı + eşleşen kural adları (`transaction_id` UNIQUE) |
 | `explanations` | Bir risk_score'a bağlı SHAP katkıları (uzun/long format — feature sayısı şemayı etkilemez) |
 | `audit_log` | Denetim izi — ML kararı için bir satır (`actor=SYSTEM`), Rule Engine gerçekten escalate ettiyse ikinci bir satır (`actor=RULE_ENGINE`) |
 | `app_users` | JWT ile giriş yapan analist/admin hesapları (banking müşterisiyle KARIŞTIRILMAMALI) |
+| `analyst_reviews` | Bir analistin REVIEW durumundaki bir işlem için kararı (`APPROVED`/`REJECTED` + not) — `risk_scores.final_action`'ın ÜZERİNE YAZMAZ, ayrı bir bilgi katmanı (`transaction_id` UNIQUE, ikinci gönderim mevcut satırı günceller) |
 
 ## API Uç Noktaları
 
@@ -90,7 +91,9 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 | `POST /api/auth/login` | Açık | `{username, password}` → `{token}` |
 | `GET /api/demo/scenarios` | Bearer JWT | Fixture senaryolarının listesi |
 | `POST /api/demo/replay/{scenarioId}` | Bearer JWT | Bir senaryoyu tetikler — `202` + `{transactionId, status: PENDING}` döner |
-| `GET /api/demo/transactions/{id}` | Bearer JWT | Skorlama sonucu — `PENDING` ya da `SCORED` + `fraudProbability/action/modelVersion` (`action` = ML+Rule Engine'in nihai/escalate edilmiş kararı) |
+| `GET /api/demo/transactions/{id}` | Bearer JWT | Polling için hafif durum sorgusu — `PENDING` ya da `SCORED` + `fraudProbability/action/modelVersion` (`action` = ML+Rule Engine'in nihai/escalate edilmiş kararı) |
+| `GET /api/demo/transactions/{id}/detail` | Bearer JWT | İşlem Detayı sayfası için tek seferlik, zengin cevap — merchant/tutar/konum + ML kararı + Rule Engine kararı + nihai karar + tüm SHAP katkıları + varsa analist kararı. Polling uç noktasından bilinçli olarak ayrı (her 1.5sn'de SHAP çekmek gereksiz yük olurdu) |
+| `POST /api/demo/transactions/{id}/review` | Bearer JWT | Bir analistin REVIEW durumundaki bir işlem için kararı (`{decision, note}`). Sadece nihai karar REVIEW ise kabul edilir, aksi halde `409 Conflict`. `reviewedBy` istemciden değil, JWT'deki kimlikten alınır |
 
 ## Çalıştırma
 
@@ -129,9 +132,9 @@ curl -H "Authorization: Bearer $TOKEN" \
 ./mvnw test
 ```
 
-47 test. 45'i unit test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`, `GlobalExceptionHandlerTest`, `ResilienceConfigTest` (circuit breaker'ın gerçekten CLOSED→OPEN geçtiğini ve OPEN'ken çağrıyı anında reddettiğini doğrular). 2'si Testcontainers ile gerçek Postgres+Kafka'ya karşı çalışan entegrasyon testi (Docker gerektirir, ~30sn) — bkz. yukarıdaki Test Stratejisi.
+55 test. 53'ü unit test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu, `getDetail`'in PENDING/SCORED/analist kararı durumları, `submitReview`'ın durum validasyonu + üzerine yazma davranışı), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`, `GlobalExceptionHandlerTest`, `ResilienceConfigTest` (circuit breaker'ın gerçekten CLOSED→OPEN geçtiğini ve OPEN'ken çağrıyı anında reddettiğini doğrular). 2'si Testcontainers ile gerçek Postgres+Kafka'ya karşı çalışan entegrasyon testi (Docker gerektirir, ~30sn) — bkz. yukarıdaki Test Stratejisi.
 
-**Uçtan uca doğrulama notu:** Escalation'ı gerçek Kafka/consumer altyapısıyla canlı doğrulamak için `rules.yaml`'daki bir eşik geçici olarak düşürülüp gerçek bir fixture ile tetiklendi (ML=APPROVE, Rule Engine=REVIEW, final_action=REVIEW, iki ayrı audit_log satırı) — sonra eşik gerçek değerine geri alındı. Mevcut 6 demo fixture'ının hiçbiri gerçek eşiklerle (>$5000, merchant_risk>0.5) bir kuralı tetiklemiyor; bu bilinçli, fixture'lar sentetik değil gerçek holdout satırları olduğu için.
+**Uçtan uca doğrulama notu:** İlk 6 demo fixture'ının hiçbiri gerçek kural eşiklerini (>$5000, yeni cihaz+>$1000, merchant_risk>0.5) tetiklemiyordu — bu yüzden escalation'ı canlı göstermek için önce `rules.yaml`'daki bir eşik geçici olarak düşürülüp test edildi, sonra geri alındı. Kalıcı çözüm olarak IEEE-CIS holdout setinde bu eşiklere GERÇEKTEN uyan bir satır arandı ve bulundu: `rule_escalation` fixture'ı (`$1.500`, yeni cihaz, gerçekte fraud değil) — ML tek başına `%0,005` olasılıkla APPROVE diyor, ama Rule Engine'in `new_device_meaningful_amount` kuralı REVIEW'a yükseltiyor. Eşik hackleme olmadan, gerçek veriyle, kalıcı olarak doğrulanabiliyor.
 
 ## Bilinen Sınırlılıklar / Sıradaki Adımlar
 
@@ -144,5 +147,5 @@ Aşağıdaki dört madde kapatıldı:
 
 Kalan bilinçli sınırlılık:
 
-- **Gerçek transaction ingestion API'si yok** — şu an sadece önceden tanımlı 6 demo senaryosu "replay" edilebiliyor, keyfi bir işlem submit edilemiyor (bilinçli — bkz. yukarıdaki fixture kararı, IEEE-CIS'in anonim sütunları serbest girişle doldurulamaz).
+- **Gerçek transaction ingestion API'si yok** — şu an sadece önceden tanımlı 7 demo senaryosu "replay" edilebiliyor, keyfi bir işlem submit edilemiyor (bilinçli — bkz. yukarıdaki fixture kararı, IEEE-CIS'in anonim sütunları serbest girişle doldurulamaz).
 - **DLQ'ya düşen mesajlar için bir redrive/yeniden işleme aracı yok** — bilinçli olarak kapsam dışı bırakıldı (portfolyo projesi ölçeğinde gereksiz); DLQ'ya düşen bir transaction kalıcı olarak `PENDING` kalır.

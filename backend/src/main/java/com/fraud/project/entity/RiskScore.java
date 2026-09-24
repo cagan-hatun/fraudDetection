@@ -64,6 +64,10 @@ public class RiskScore {
     @Column(name = "feature_snapshot", nullable = false, columnDefinition = "jsonb")
     private Map<String, Object> featureSnapshot;
 
+    /** SHAP waterfall'ının başlangıç noktası — ml-service /explain'den. */
+    @Column(name = "base_value", precision = 10, scale = 6)
+    private java.math.BigDecimal baseValue;
+
     @CreationTimestamp
     @Column(name = "scored_at", nullable = false, updatable = false)
     private OffsetDateTime scoredAt;

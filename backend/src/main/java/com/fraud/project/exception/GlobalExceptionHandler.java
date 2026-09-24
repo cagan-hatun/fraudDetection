@@ -12,6 +12,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
+import com.fraud.project.service.InvalidReviewStateException;
+
 /**
  * Tüm REST katmanı için tek hata çevirme noktası. ResponseEntityExceptionHandler'ı
  * extend ediyoruz ki Spring'in kendi framework hataları (malformed JSON, desteklenmeyen
@@ -25,6 +27,13 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(NoSuchElementException.class)
     public ProblemDetail handleNotFound(NoSuchElementException e, WebRequest request) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
+        problem.setInstance(requestPath(request));
+        return problem;
+    }
+
+    @ExceptionHandler(InvalidReviewStateException.class)
+    public ProblemDetail handleInvalidReviewState(InvalidReviewStateException e, WebRequest request) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
         problem.setInstance(requestPath(request));
         return problem;
     }
