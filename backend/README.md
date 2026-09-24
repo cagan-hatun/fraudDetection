@@ -66,7 +66,7 @@ Tüm çözümler `config/MlServiceConfig.java`'da.
 
 ### 5. JWT — elle yazılmış filtre, ayrı `app_users` tablosu
 
-İki bilinçli tercih: (a) JWT, Spring'in OAuth2 Resource Server soyutlaması yerine `io.jsonwebtoken` (jjwt) ile elle yazıldı — token üretimi/doğrulamasının gerçekten nasıl çalıştığını göstermek için (mülakat/öğrenme değeri). (b) Giriş yapan analist/admin hesapları (`app_users`), skorlanan banka müşterisini temsil eden `users` tablosundan tamamen ayrı — bunlar birbirine karıştırılabilecek ama kavramsal olarak apayrı iki kavram. `JwtAuthenticationFilter` token'ı doğrulayıp `SecurityContext`'i dolduruyor; asıl "yetkili mi" kararını `SecurityConfig`'deki `authorizeHttpRequests` veriyor.
+İki bilinçli tercih: (a) JWT, Spring'in OAuth2 Resource Server soyutlaması yerine `io.jsonwebtoken` (jjwt) ile elle yazıldı — claim yapısı, süre ve imzalama algoritması üzerinde tam kontrol için; bu ölçekteki bir servis için tam bir Resource Server soyutlaması gereksiz bir bağımlılık katmanı ekliyordu. (b) Giriş yapan analist/admin hesapları (`app_users`), skorlanan banka müşterisini temsil eden `users` tablosundan tamamen ayrı — bunlar birbirine karıştırılabilecek ama kavramsal olarak apayrı iki kavram. `JwtAuthenticationFilter` token'ı doğrulayıp `SecurityContext`'i dolduruyor; asıl "yetkili mi" kararını `SecurityConfig`'deki `authorizeHttpRequests` veriyor.
 
 ### 6. Test stratejisi
 
@@ -103,7 +103,7 @@ Bu yüzden `POST /api/transactions`, "kullanıcı formdan elle bir işlem girer"
 
 Projenin JWT gerektirmeyen TEK endpoint'i (`permitAll`) olduğu için brute-force denemesine en açık nokta da o — `LoginRateLimitFilter` (bucket4j, token bucket algoritması) IP başına dakikada 5 deneme sınırı koyuyor.
 
-- **Kütüphane tercihi:** JWT'nin aksine (elle yazıldı, "nasıl çalıştığını göster" amacıyla) burada bucket4j gibi endüstri standardı bir kütüphane tercih edildi — token bucket algoritmasının kendisini (burst toleransı, sızdıran kova vb.) yeniden yazmanın öğretici bir değeri yoktu, olgun bir kütüphane kullanmak daha gerçekçi.
+- **Kütüphane tercihi:** JWT'nin aksine (elle yazılan bir filtre) burada bucket4j gibi endüstri standardı bir kütüphane tercih edildi — token bucket algoritmasının kendi edge-case'lerini (burst toleransı, sızdıran kova vb.) yeniden implemente etmek gereksiz risk taşıyordu, olgun bir kütüphane kullanmak daha güvenilir.
 - **Ham bir servlet filtresi, MVC handler'ı değil:** `OncePerRequestFilter` olarak yazıldı (JwtAuthenticationFilter ile aynı desen) ve `SecurityConfig`'te `JwtAuthenticationFilter`'dan ÖNCE zincire ekleniyor — bu yüzden `GlobalExceptionHandler` devreye giremiyor, 429 gövdesi elle (RFC 7807 benzeri bir `Map`) yazılıyor.
 - **Bellek içi, IP başına ayrı bucket:** `ConcurrentHashMap<String, Bucket>` — tek instance için yeterli (bkz. `ResilienceConfig`'in aynı gerekçesi); birden çok backend instance'ı olsaydı paylaşılan bir store (Redis) gerekirdi.
 - Canlı doğrulandı: aynı IP'den art arda 6 giriş denemesi yapıldı, ilk 5'i normal `401`/`200` döndü, 6.'sı `429 Too Many Requests` verdi.
