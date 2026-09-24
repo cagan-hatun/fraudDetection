@@ -49,6 +49,10 @@ public class SecurityConfig {
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers("/api/auth/**").permitAll()
                 .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
+                // DLQ redrive gibi altyapı kurtarma işlemleri bir analistin değil, bir
+                // operasyon/altyapı sorumlusunun yapacağı bir iş — bu yüzden projede
+                // ilk kez rol bazlı bir ayrım burada devreye giriyor.
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
                 .anyRequest().authenticated())
             .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
             .build();

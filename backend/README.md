@@ -80,6 +80,16 @@ Bu yüzden `POST /api/transactions`, "kullanıcı formdan elle bir işlem girer"
 
 **Bilinçli olarak yapılmayan:** `amount` (domain, `transactions` tablosuna yazılır) ile `features.TransactionAmt` (modele giden ham değer) arasında otomatik senkronizasyon YOK — tutarlılık çağıranın sorumluluğunda (fixture'larda da aynı ayrım zaten vardı, yeni bir tutarsızlık değil).
 
+### 8. DLQ redrive — `POST /api/admin/dlq/{ml-service|rule-engine}/redrive`
+
+`KafkaErrorHandlingConfig`'in DLT'lerine düşen mesajlar (3 başarısız denemeden sonra) kalıcı olarak orada kalıyordu — `DlqRedriveService` bunları AYNI gerçek servis metoduyla (`score()`/`evaluate()`) yeniden işletiyor.
+
+- **Neden Kafka'ya geri yayınlamak yerine doğrudan servis çağrısı:** DLT mesajını ham `transactions` topic'ine geri basmak, HER İKİ consumer group'un da (ML + Rule Engine) mesajı TEKRAR almasına yol açardı — oysa çoğu zaman sadece BİRİ başarısız olmuştur (bkz. canlı doğrulama). Diğer taraf zaten başarılıysa (`rule_evaluations.transaction_id` UNIQUE) ikinci kez işlenmeye çalışılınca constraint ihlaliyle gereksiz bir hataya düşerdi. Redrive bu yüzden DLT'nin AİT OLDUĞU tarafı (hangi DLT'den geldiğini bilerek) doğrudan çağırıyor.
+- **Offset takibi elle değil, Kafka'nın kendi mekanizmasıyla:** Her redrive çağrısı kısa ömürlü bir consumer açıyor, kendi KALICI consumer group'unu kullanıyor (`fraud-backend-dlq-redrive` / `fraud-rule-engine-dlq-redrive`). Bir mesaj başarıyla redrive edilince offset'i HEMEN commit ediliyor; bir mesaj başarısız olursa (örn. ml-service hâlâ kapalı) commit edilmeden durulur — o mesaj ve aynı partition'daki sonrakiler DLT'de kalır, BİR SONRAKİ redrive çağrısında tekrar denenir. "Hangi mesajlar zaten redrive edildi" bilgisini elle saklamaya hiç gerek yok.
+- **Yetkilendirme — ilk kez gerçek RBAC:** `/api/admin/**` sadece `ROLE_ADMIN` (`SecurityConfig`). Projede o ana kadar her endpoint "geçerli JWT yeter" diyordu; DLQ redrive gibi bir altyapı kurtarma işlemi bir analistin değil bir operasyon sorumlusunun işi olduğu için `AppRole.ADMIN` ilk kez gerçek anlamda kullanılıyor (V6 migration'ı demo bir admin hesabı seed ediyor: `admin`/`ChangeMeAdmin123!`).
+- **Canlı doğrulandı:** `ml-service.base-url` geçici olarak geçersiz bir adrese çevrildi, bir işlem tetiklendi, 3 deneme sonrası mesaj `transactions.fraud-backend.DLT`'ye düştüğü Kafka konsol tüketicisiyle doğrulandı (işlem `PENDING` kaldı, `rule_evaluations`'da satır vardı ama `risk_scores`'da yoktu — Rule Engine tarafı bağımsız olarak başarılıydı). `ml-service.base-url` düzeltilip redrive çağrıldığında `{"found":2,"succeeded":2,"failed":0}` döndü, işlem `SCORED`'a geçti; DLT gerçekten boşalmıştı çünkü ikinci bir redrive çağrısı `{"found":0,"succeeded":0,"failed":0}` verdi.
+- **Bilinen not — soğuk başlangıç gecikmesi:** Her redrive çağrısı YENİ bir consumer olduğu için sıfırdan bir Kafka group-join el sıkışması gerekiyor; bu ortamda gözlemlenen gecikme ~20 saniyeye kadar çıkabiliyor (`DlqRedriveService`'teki `MAX_CONSECUTIVE_EMPTY_POLLS` bunu tolere edecek şekilde ayarlı). Sık çağrılan bir uç nokta değil, bu yüzden kabul edilebilir bir maliyet.
+
 ## Veritabanı Şeması
 
 | Tablo | Amaç |
@@ -89,7 +99,7 @@ Bu yüzden `POST /api/transactions`, "kullanıcı formdan elle bir işlem girer"
 | `rule_evaluations` | Rule Engine'in ML'den bağımsız kendi kararı + eşleşen kural adları (`transaction_id` UNIQUE) |
 | `explanations` | Bir risk_score'a bağlı SHAP katkıları (uzun/long format — feature sayısı şemayı etkilemez) |
 | `audit_log` | Denetim izi — ML kararı için bir satır (`actor=SYSTEM`), Rule Engine gerçekten escalate ettiyse ikinci bir satır (`actor=RULE_ENGINE`) |
-| `app_users` | JWT ile giriş yapan analist/admin hesapları (banking müşterisiyle KARIŞTIRILMAMALI) |
+| `app_users` | JWT ile giriş yapan analist/admin hesapları (banking müşterisiyle KARIŞTIRILMAMALI). `role` (ANALYST/ADMIN) artık gerçek anlamda kullanılıyor — bkz. DLQ redrive'ın `/api/admin/**` kısıtlaması |
 | `analyst_reviews` | Bir analistin REVIEW durumundaki bir işlem için kararı (`APPROVED`/`REJECTED` + not) — `risk_scores.final_action`'ın ÜZERİNE YAZMAZ, ayrı bir bilgi katmanı (`transaction_id` UNIQUE, ikinci gönderim mevcut satırı günceller) |
 
 ## API Uç Noktaları
@@ -103,6 +113,8 @@ Bu yüzden `POST /api/transactions`, "kullanıcı formdan elle bir işlem girer"
 | `GET /api/demo/transactions/{id}/detail` | Bearer JWT | İşlem Detayı sayfası için tek seferlik, zengin cevap — merchant/tutar/konum + ML kararı + Rule Engine kararı + nihai karar + tüm SHAP katkıları + varsa analist kararı. Polling uç noktasından bilinçli olarak ayrı (her 1.5sn'de SHAP çekmek gereksiz yük olurdu) |
 | `POST /api/demo/transactions/{id}/review` | Bearer JWT | Bir analistin REVIEW durumundaki bir işlem için kararı (`{decision, note}`). Sadece nihai karar REVIEW ise kabul edilir, aksi halde `409 Conflict`. `reviewedBy` istemciden değil, JWT'deki kimlikten alınır |
 | `POST /api/transactions` | Bearer JWT | `/api/demo/**`'den bilinçli olarak AYRI — sabit bir fixture'a bakmaz, çağıran TAM ~120 sütunluk feature vektörünü kendisi sağlar (bkz. aşağıdaki "Gerçek transaction ingestion" bölümü). `@Valid` ile alan bazlı doğrulama (`400` + RFC 7807 hatalı istekte), sonrası `/replay` ile AYNI gerçek pipeline (Kafka→ML+Rules→escalate-only merge) |
+| `POST /api/admin/dlq/ml-service/redrive` | Bearer JWT + `ROLE_ADMIN` | `transactions.fraud-backend.DLT`'deki mesajları yeniden işler, `{found, succeeded, failed}` döner. Analist token'ıyla çağrılırsa `403` |
+| `POST /api/admin/dlq/rule-engine/redrive` | Bearer JWT + `ROLE_ADMIN` | Aynısı `transactions.fraud-rule-engine.DLT` için |
 
 ## Çalıştırma
 
@@ -141,20 +153,19 @@ curl -H "Authorization: Bearer $TOKEN" \
 ./mvnw test
 ```
 
-58 test. 56'sı unit test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı, `ingest()`'in `transactionTime` verilmezse şimdiki zamana varsayılan gelmesi), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu, `getDetail`'in PENDING/SCORED/analist kararı durumları, `submitReview`'ın durum validasyonu + üzerine yazma davranışı), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`, `GlobalExceptionHandlerTest`, `ResilienceConfigTest` (circuit breaker'ın gerçekten CLOSED→OPEN geçtiğini ve OPEN'ken çağrıyı anında reddettiğini doğrular). 2'si Testcontainers ile gerçek Postgres+Kafka'ya karşı çalışan entegrasyon testi (Docker gerektirir, ~30sn) — bkz. yukarıdaki Test Stratejisi.
+62 test. 60'ı unit test (Docker/DB gerektirmez): `DemoFixtureLoaderTest`, `TransactionReplayServiceTest` (find-or-create mantığı, event'in ancak commit SONRASI basıldığı, `ingest()`'in `transactionTime` verilmezse şimdiki zamana varsayılan gelmesi), `TransactionScoringServiceTest` (ml-service çağrıları, feature_snapshot/explanations/audit_log yazımı, finalize tetikleme, durum sorgusu, `getDetail`'in PENDING/SCORED/analist kararı durumları, `submitReview`'ın durum validasyonu + üzerine yazma davranışı), `RuleEngineServiceTest`, `RiskFinalizationServiceTest` (escalate-only mantığın TÜM kombinasyonları + idempotency + audit_log yalnızca escalation olduğunda), `RuleEvaluatorTest` (SpEL, çoklu kural eşleşmesi, eksik feature güvenliği), `RuleDefinitionLoaderTest`, Kafka producer/consumer testleri, `JwtServiceTest`, `AppUserDetailsServiceTest`, `GlobalExceptionHandlerTest`, `ResilienceConfigTest` (circuit breaker'ın gerçekten CLOSED→OPEN geçtiğini ve OPEN'ken çağrıyı anında reddettiğini doğrular), `DlqRedriveServiceTest` (tüm mesajlar başarılı → her offset ayrı commit; bir mesaj başarısız → o ve sonrakiler commit edilmeden bırakılır; iki DLT'nin kendi bağımsız consumer group'unu kullandığı). 2'si Testcontainers ile gerçek Postgres+Kafka'ya karşı çalışan entegrasyon testi (Docker gerektirir, ~30sn) — bkz. yukarıdaki Test Stratejisi.
 
 **Uçtan uca doğrulama notu:** İlk 6 demo fixture'ının hiçbiri gerçek kural eşiklerini (>$5000, yeni cihaz+>$1000, merchant_risk>0.5) tetiklemiyordu — bu yüzden escalation'ı canlı göstermek için önce `rules.yaml`'daki bir eşik geçici olarak düşürülüp test edildi, sonra geri alındı. Kalıcı çözüm olarak IEEE-CIS holdout setinde bu eşiklere GERÇEKTEN uyan bir satır arandı ve bulundu: `rule_escalation` fixture'ı (`$1.500`, yeni cihaz, gerçekte fraud değil) — ML tek başına `%0,005` olasılıkla APPROVE diyor, ama Rule Engine'in `new_device_meaningful_amount` kuralı REVIEW'a yükseltiyor. Eşik hackleme olmadan, gerçek veriyle, kalıcı olarak doğrulanabiliyor.
 
 ## Bilinen Sınırlılıklar / Sıradaki Adımlar
 
-Aşağıdaki beş madde kapatıldı:
+Aşağıdaki altı madde kapatıldı:
 
 - ✅ **Global exception handler** — `exception/GlobalExceptionHandler.java`, tüm hatalar (bizimkiler + Spring'in framework hataları) RFC 7807 `ProblemDetail` formatında dönüyor, stack trace client'a sızmıyor.
 - ✅ **Kafka retry/DLQ** — `config/KafkaErrorHandlingConfig.java`, her consumer group için ayrı hata yönetimi (3 deneme + 1sn backoff, sonra group'a özel bir Dead Letter Topic: `transactions.fraud-backend.DLT` / `transactions.fraud-rule-engine.DLT`).
 - ✅ **Resilience4j** — `config/ResilienceConfig.java`, ml-service çağrıları etrafında circuit breaker (kasıtlı olarak retry yok, Kafka'nın kendi retry'ıyla çakışmasın diye; fallback yok, DLQ zaten güvenlik ağı).
 - ✅ **Testcontainers** — `PostgresPersistenceIntegrationTest` ve `KafkaRetryAndDeadLetterIntegrationTest`, gerçek Postgres+Kafka container'larına karşı çalışıyor.
 - ✅ **Gerçek transaction ingestion API'si** — `POST /api/transactions`, bkz. yukarıdaki "Gerçek transaction ingestion" bölümü. Sabit fixture'lara bağımlı olmayan, çağıranın kendi feature vektörünü sağladığı ve AYNI gerçek pipeline'dan geçen bir uç nokta.
+- ✅ **DLQ redrive aracı** — `POST /api/admin/dlq/{ml-service|rule-engine}/redrive`, bkz. yukarıdaki "DLQ redrive" bölümü. `ROLE_ADMIN` ile korunuyor, canlı olarak gerçek bir DLQ senaryosuyla (ml-service geçici olarak erişilemez yapılıp) uçtan uca doğrulandı.
 
-Kalan bilinçli sınırlılık:
-
-- **DLQ'ya düşen mesajlar için bir redrive/yeniden işleme aracı yok** — bilinçli olarak kapsam dışı bırakıldı (portfolyo projesi ölçeğinde gereksiz); DLQ'ya düşen bir transaction kalıcı olarak `PENDING` kalır.
+Backend artık kendi bilinçli kapsamında bilinen bir sınırlılık taşımıyor.
